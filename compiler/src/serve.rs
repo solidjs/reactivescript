@@ -3,11 +3,12 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-/// One request: `analyze` (`{file, overlays, prelude}`) or `prelude`.
+/// One request: `analyze` (`{file, overlays, prelude, project}`), `app` (`{entry, overlays, target, moduleName, spa, jsx}`) or `prelude`.
 pub fn request(method: &str, params: &Value, disk: &dyn Fn(&str) -> Option<String>) -> Value {
     match method {
         "analyze" => analyze(params, disk),
         "prelude" => json!(crate::project::PRELUDE),
+        "app" => app(params, disk),
         _ => json!({ "error": "unknown method" }),
     }
 }
@@ -60,12 +61,17 @@ pub fn utf16_index(s: &str) -> Vec<u32> {
     idx
 }
 
+/// A request's `overlays`: the editor's open files, read before the disk.
+fn overlays(params: &Value) -> HashMap<String, String> {
+    params["overlays"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default()
+}
+
 /// `rxc serve`, one request: `{file, overlays: {path: text}, prelude}` — the file loaded (and its imports) as an editor
 /// has them, recovering (CP-8e); its projection with mappings in UTF-16 offsets, and its diagnostics: the parse's, else
 /// the checker's.
 pub fn analyze(params: &Value, disk: &dyn Fn(&str) -> Option<String>) -> Value {
     let file = params["file"].as_str().unwrap_or_default().to_string();
-    let overlays: HashMap<String, String> = params["overlays"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default();
+    let overlays = overlays(params);
     let read = |p: &str| overlays.get(p).cloned().or_else(|| disk(p));
     let set = match crate::modules::load_modules_recovering(&file, &read) {
         Ok(s) => s,
@@ -77,7 +83,9 @@ pub fn analyze(params: &Value, disk: &dyn Fn(&str) -> Option<String>) -> Value {
     let src = set.sources.get(&file).cloned().unwrap_or_default();
     let prelude = params["prelude"].as_str();
     let mut out = json!({ "code": null, "mappings": [] });
-    if let Some(p) = crate::project::project_modules_with(&set, prelude).into_iter().find(|p| p.rx == file) {
+    // `project: false`: diagnostics only, for a caller that does not show the TSX projection
+    let project = params["project"].as_bool().unwrap_or(true);
+    if let Some(p) = project.then(|| crate::project::project_modules_with(&set, prelude).into_iter().find(|p| p.rx == file)).flatten() {
         let (gi, si) = (utf16_index(&p.code), utf16_index(&src));
         let maps: Vec<[u32; 3]> = p.mappings.iter().map(|m| [gi[m.gen as usize], si[m.src as usize], si[(m.src + m.len) as usize] - si[m.src as usize]]).collect();
         let u = |i: &[u32], a: u32, n: u32| [i[a as usize], i[(a + n) as usize] - i[a as usize]];
@@ -93,3 +101,12 @@ pub fn analyze(params: &Value, disk: &dyn Fn(&str) -> Option<String>) -> Value {
     out
 }
 
+
+/// `rxc app` over the editor's files: what `app.rs` returns for `entry`, reading `overlays` before the disk.
+pub fn app(params: &Value, disk: &dyn Fn(&str) -> Option<String>) -> Value {
+    let overlays = overlays(params);
+    let read = |p: &str| overlays.get(p).cloned().or_else(|| disk(p));
+    let target = crate::app::target(params["target"].as_str().unwrap_or("dom"));
+    let module_name = params["moduleName"].as_str().unwrap_or("@solidjs/web");
+    crate::app::app_with(params["entry"].as_str().unwrap_or_default(), target, module_name, params["spa"].as_bool().unwrap_or(false), params["jsx"].as_bool().unwrap_or(false), &read)
+}

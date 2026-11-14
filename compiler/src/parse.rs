@@ -1216,11 +1216,16 @@ pub fn parse_block(c: &mut Cursor) -> R<Vec<Stmt>> {
     c.ws(true);
     let mut out = vec![];
     while !c.starts_with("}") {
+        let at = c.i;
         out.push(parse_stmt(c)?);
         out.append(&mut c.pending);
         c.ws(true);
         c.eat(";");
         c.ws(true);
+        // an editor's parse reads a missing statement as an empty one, so at the end of input nothing moves
+        if c.i == at {
+            break;
+        }
     }
     c.expect("}")?;
     Ok(out)
@@ -2254,6 +2259,13 @@ mod recovering {
         assert_eq!(names(&p), ["a", "b", "App"]);
         assert_eq!(errs.len(), 2);
         assert!(parse_program(src).is_err());
+    }
+
+    #[test]
+    fn an_unclosed_block_at_the_end_of_input_stops() {
+        let src = "export default component App() {\n  <button onClick={() => { c";
+        let (_, errs) = parse_program_recovering(src);
+        assert!(!errs.is_empty());
     }
 
     #[test]
