@@ -29,6 +29,10 @@
 - `props` in a component declared without props (`component C()`) is `UNBOUND` (RG-4b); it read `undefined`.
 - `guide/async.md`: "One store over the server"; the `GUESS_WHILE_LOADING` advice says what holds when a selection
   changes while a guess is out (05 DV-22).
+- Under `vite dev`, an edit inside a dependency's components re-renders them in place instead of reloading the page:
+  the module's top-level sources and every other component's state are kept. An edit to the module's top level or to
+  an entry still reloads. The runtime's new `@reactivescript/runtime/hot` entry does the swap; it needs a
+  `@solidjs/vite-plugin` with the front end's `hotUpdate` hook.
 
 ## 0.3.1
 
