@@ -34,8 +34,8 @@ Ours, fixed here:
 - app 1 seed 19, app 6 seed 13 (page error "declined"): a click read a failed list through a component. App 1's
   `onMove`, written on the board, read the other columns' lists; app 6's lane handler read `props.lens`, a memo over
   all three. R-8 never looked through components. It now does (spec/04-rows.md R-8 "Through components"); app 1 is a
-  compile error. App 6 is not: its `disabled` reads `props.lens` behind `props.column == "done" && …`, and R-8 counts
-  any read, guarded or not.
+  compile error. App 6 is too (2026-11-25): its `disabled` reads `props.lens` behind `props.column == "done" && …`,
+  which reads it only in the done lane, so R-8 now counts such a read only where the site's props make it.
 - apps 3, 6 "a move into a column that is still loading": they declare `-> null` and the `[]` stand-in the guide
   teaches, so the handler sends index 0 into a column it hasn't seen. Guide (async.md §1): the stand-in is not an
   answer; keep a control that computes from the list disabled while it is null.
