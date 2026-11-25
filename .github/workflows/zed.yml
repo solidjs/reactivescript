@@ -1,0 +1,38 @@
+# The Zed extension (tooling/zed-rx): the extension builds for the target Zed loads, and its queries run on the
+# grammar extension.toml pins. A query naming a node that grammar does not have stops Zed loading the language.
+name: zed
+
+on:
+  push:
+    branches: [main]
+    paths: ["tooling/zed-rx/**", "examples/*.rx", ".github/workflows/zed.yml"]
+  pull_request:
+    paths: ["tooling/zed-rx/**", "examples/*.rx", ".github/workflows/zed.yml"]
+  workflow_dispatch:
+
+jobs:
+  extension:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tooling/zed-rx
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tooling/zed-rx
+      - run: cargo fmt --check
+      - run: cargo clippy --release --target wasm32-wasip2 -- -D warnings
+      - run: cargo build --release --target wasm32-wasip2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1   # as editor.yml
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Queries, on the pinned grammar
+        run: ./check-queries.sh

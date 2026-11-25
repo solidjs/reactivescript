@@ -1,0 +1,19 @@
+id = "reactivescript"
+name = "ReactiveScript"
+version = "0.1.0"
+schema_version = 1
+authors = ["Ryan Carniato"]
+description = "ReactiveScript (.rx, .d.rx): highlighting, and TypeScript's types, hover, go to definition, completion and errors through the .rx language server."
+repository = "https://github.com/solidjs/reactivescript"
+
+[language_servers.rx-language-server]
+name = "ReactiveScript Language Server"
+languages = ["ReactiveScript"]
+
+[language_servers.rx-language-server.language_ids]
+"ReactiveScript" = "reactivescript"
+
+[grammars.rx]
+repository = "https://github.com/solidjs/reactivescript"
+path = "tooling/tree-sitter-rx"
+rev = "b4706142a696d24bc09911b195abc6a59e079b17"

@@ -74,7 +74,9 @@ vim.lsp.config("rx", {
 vim.lsp.enable("rx")
 ```
 
-Neovim has no `.rx` grammar yet; the server's semantic tokens color names.
+For highlighting, install the tree-sitter grammar in
+[`../tree-sitter-rx`](../tree-sitter-rx) as the parser for `reactivescript`;
+without it, the server's semantic tokens color names.
 
 **Helix**, in `languages.toml`:
 
@@ -98,8 +100,9 @@ language server with the command
 map the file name pattern `*.rx` to it, and add the `tooling/vscode-rx`
 folder under Settings › Editor › TextMate Bundles for highlighting.
 
-**Zed** needs an extension of its own (a Zed extension declares the language
-and starts the server); there isn't one yet.
+**Zed**: the extension in [`../zed-rx`](../zed-rx), which installs this server
+from npm and highlights with the tree-sitter grammar in
+[`../tree-sitter-rx`](../tree-sitter-rx).
 
 The `/path/to/reactivescript` paths are a checkout of this repository; with
 the npm package, the command is `npx @reactivescript/language-server --stdio`
