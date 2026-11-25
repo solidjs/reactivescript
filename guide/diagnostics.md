@@ -277,10 +277,12 @@ export default component App() {
 ### STALE_CAPTURE
 
 After an `await`, a write into a source with a question (the server's answer) takes only what the server answered,
-plain arguments (an id, a title, an index) and the answer's own value at the write (`x := rs => …`, finding rows there
-by id). A row the action was given, or read from a source before the `await` or after it, is what the screen showed:
-by then it may have changed (a rename accepted), be somewhere else (an earlier move declined) or carry a write another
-action still holds, so the screen loses the edit or shows the row twice. When the answer doesn't say where a row is now
+what the user gave (an id, a title typed in, an index) and the answer's own value at the write (`x := rs => …`, finding
+rows there by id). A row the action was given, or read from a source before the `await` or after it, is what the screen
+showed: by then it may have changed (a rename accepted), be somewhere else (an earlier move declined) or carry a write
+another action still holds, so the screen loses the edit or shows the row twice. The same goes for a row's fields
+passed one by one (its title, its count): the check can't see where those came from, so read them from the answer at
+the write, or re-ask. When the answer doesn't say where a row is now
 (a move answers only where it went), re-ask the answers it left and joined with `refresh`.
 
 ```rx before

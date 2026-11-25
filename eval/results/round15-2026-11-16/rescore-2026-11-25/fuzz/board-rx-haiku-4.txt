@@ -1,0 +1,5 @@
+board-rx-haiku-4: 2/20 seeds found a hole
+  seed 1 step 37: card count: card "#2 Fix login · 1/5", server 1/4 with 0 toggle(s) and 0 item add(s) of it in the air
+    add Bravo 1 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; tab archive ; land fetchCards:done ; tab board ; add Alpha 2 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; add Alpha 3 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; add Bravo 4 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; add Alpha 5 ; (move failed: locator.fill: Timeout 2000ms exceeded.)
+  seed 18 step 26: card count: card "#5 Alpha · 3/5", server 3/6 with 0 toggle(s) and 0 item add(s) of it in the air
+    land fetchCards:doing ; land fetchCards:done ; select #3 ; select #4 ; select #5 ; add Bravo 1 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; land fetchChecklist:5 ; select #4 ; land fetchCards:todo ; land fetchChecklist:3 ; rename Bravo ; land fetchChecklist:4 ; land renameCard:4,Bravo ; select #5 ; land fetchChecklist:5 ; rename Alpha ; land renameCard:5,Alpha ; add-item ship 2 ; 

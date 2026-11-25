@@ -1,0 +1,5 @@
+board-rx-haiku-6: 2/20 seeds found a hole
+  seed 8 step 33: card count: card "#5 Delta · 3/3", server 1/3 with 0 toggle(s) and 0 item add(s) of it in the air
+    land fetchCards:doing ; right #3 ; select #4 ; fail fetchCards:done ; left #3 ; retry-done ; fail fetchCards:todo ; up #4 ; select #4 ; land fetchCards:done ; select #5 ; land fetchChecklist:5 ; retry-todo ; left #5 ; land fetchChecklist:4 ; right #3 ; land fetchCards:todo ; down #1 ; land moveCard:3,done,0 ; fail moveCard:5,doing,2 ; land moveCard:1,todo,1 ; land moveCard:4,doing,0 ; toggle 1
+  seed 17 step 23: settled: card: "#4 Deploy · 0/1", server "#4 Delta · 0/1"
+    add Bravo 1 ; land fetchCards:todo ; land fetchCards:done ; tab archive ; land fetchCards:doing ; tab board ; land fetchCards:todo ; add Bravo 2 ; add Alpha 3 ; land fetchCards:done ; add Bravo 4 ; land fetchArchived: ; land fetchCards:doing ; select #4 ; land fetchChecklist:4 ; select #4 ; up #4 ; left #5 ; land moveCard:5,doing,2 ; select #4 ; rename Delta ; land renameCard:4,Delta ; land mo

@@ -1,0 +1,8 @@
+  reopened: expected screen
+  settled: body Issues User Open Closed #3 Crash on save (unassigned) assign to guest close #4 Typo in footer (dana) assign to guest close select an issue Issues (2) Help Settings (before: #1 Login fails (unassigned),#3 Crash on save (unassigned),#4 Typo in footer (dana))
+  reopened: expected screen
+  settled: body Issues User Open Closed #1 Login fails (unassigned) assign to guest close #3 Crash on save (unassigned) assign to guest close #4 Typo in footer (dana) assign to guest close select an issue Issues (3) Help Settings
+✓ HOLD reopened with a row close out: the open list
+✓ HOLD reopened from the closed list with an assign out: the open list
+
+2/2 passed

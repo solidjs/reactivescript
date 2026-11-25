@@ -11,7 +11,8 @@
 - `UNGUARDED_SNAPSHOT` (R-8) looks through components: a callback prop given to a component, and a component's handler
   that reads `props.f`, are checked against what each site passes and what the component's regions show. A click that
   reads a list its region never shows (another column's cards, say) is now a compile error instead of a failure thrown
-  out of the click.
+  out of the click. A `disabled` that reads the value only behind `&&` or `?:` covers it only where the site's props
+  make that read.
 
 **Fixed**
 

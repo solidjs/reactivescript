@@ -1,0 +1,9 @@
+  reopened: expected screen
+  settled: body Issues (2) Help Settings user open closed #3 Crash on save (unassigned) assign to guest close #4 Typo in footer (dana) assign to guest close select an issue (before: #1 Login fails (unassigned),#3 Crash on save (unassigned),#4 Typo in footer (dana))
+  NOW: body Issues (3) Help Settings pick a result
+  BEFORE: body Issues (3) Help Settings user open closed #2 Old bug (guest) assign to guest select an issue
+✓ HOLD reopened with a row close out: the open list
+✗ HOLD reopened from the closed list with an assign out: the open list
+    reopened: TEAR — neither expected (expected [list] to show "loading open issues", it shows nothing (no such element)) nor held.
+
+1/2 passed

@@ -133,6 +133,10 @@ and where they may not go.
   component's region around the element (or the element's `disabled`) reads
   a prop that site binds to the same value. A value that takes its failure
   from another (`n = rows.length`) is covered wherever that one is. A
+  `disabled` or region read covers only if it is made: the right of `&&`,
+  `||`, `??` and the arms of `?:` count where the site's props decide them
+  (`props.col == "done" && props.full` reads `props.full` only at a site
+  that passes `col="done"`). A
   component from another module is trusted to show what it is handed.
   (Found by the r17 board apps 1 and 6, eval/results/rerun-2026-11-23: a
   column's `onMove` written in the board read the other columns' lists, and

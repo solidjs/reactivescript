@@ -1,0 +1,7 @@
+board-rx-haiku-4: 3/20 seeds found a hole
+  seed 7 step 26: duplicate card: #11 shows in todo and todo
+    land fetchCards:todo ; land fetchCards:done ; land fetchCards:doing ; select #2 ; land fetchChecklist:2 ; add-item ship 1 ; fail addItem:2,ship 1 ; add Delta 2 ; land addCard:todo,Delta 2 ; rename Delta ; add-item qa 3 ; land fetchCards:todo ; select #1 ; rename Delta ; fail addItem:2,qa 3 ; land fetchChecklist:1 ; land renameCard:2,Delta ; land fetchCards:done ; rename Bravo ; select #3 ; add
+  seed 8 step 31: duplicate card: #10 shows in todo and todo
+    land fetchCards:doing ; add Alpha 1 ; select #4 ; land fetchCards:done ; land fetchChecklist:4 ; fail fetchCards:todo ; retry-todo ; select #4 ; land fetchCards:todo ; add Alpha 2 ; add-item docs 3 ; rename Bravo ; fail addCard:todo,Alpha 2 ; land renameCard:4,Bravo ; select #3 ; add-item ship 4 ; select #3 ; select #1 ; archive #1 ; land addItem:4,docs 3 ; add Bravo 5 ; select #2 ; fail archi
+  seed 20 step 28: duplicate card: #10 shows in todo and todo
+    add Bravo 1 ; land fetchCards:doing ; add Bravo 2 ; select #3 ; land fetchCards:done ; land fetchChecklist:3 ; land fetchCards:todo ; add-item qa 3 ; add-item ship 4 ; fail addItem:3,qa 3 ; fail addItem:3,ship 4 ; select #5 ; rename Delta ; add Bravo 5 ; land renameCard:5,Delta ; land fetchCards:todo ; add-item qa 6 ; (move failed: locator.click: Timeout 2000ms exceeded.) ; add Delta 7 ; fail 

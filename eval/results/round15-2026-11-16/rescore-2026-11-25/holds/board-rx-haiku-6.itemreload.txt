@@ -1,0 +1,5 @@
+  expected screen
+✗ HOLD an item added while the checklist reloads shows once
+    expected [col-todo] cards ["#1 Write spec · 0/2","#2 Fix login · 2/4"], got ["#1 Write spec · 0/2","#2 Fix login · 1/4"]
+
+0/1 passed

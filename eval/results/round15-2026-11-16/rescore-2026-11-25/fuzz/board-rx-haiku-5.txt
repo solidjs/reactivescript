@@ -1,0 +1,9 @@
+board-rx-haiku-5: 4/20 seeds found a hole
+  seed 4 step 42: two views: card "#3 Review PR · 2/2", detail "#3 in renamearchive[x] readtoggle[x] approvetoggle2/2 doneadd"
+    add Alpha 1 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; land fetchCards:todo ; land fetchCards:done ; tab archive ; land fetchArchived: ; tab board ; add Delta 2 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; tab archive ; tab board ; add Delta 3 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; add Bravo 4 ; (move failed: locator.fill: Timeout 2000ms exceeded.
+  seed 8 step 7: two views: card "#4 Deploy · 0/1", detail "#4 in renamearchiveloading checklist"
+    land fetchCards:doing ; right #3 ; select #4 ; fail fetchCards:done ; left #3 ; retry-done ; fail fetchCards:todo
+  seed 13 step 12: two views: card "#4 Deploy · 0/1", detail "#4 in renamearchive[ ] releasetoggle0/1 doneadd"
+    add Alpha 1 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; fail fetchCards:todo ; land fetchCards:doing ; retry-todo ; left #3 ; right #4 ; select #4 ; right #3 ; land fetchChecklist:4 ; fail fetchCards:done ; land fetchCards:todo
+  seed 17 step 27: settled: card: "#4 Deploy · 0/1", server "#4 Delta · 0/1"
+    add Bravo 1 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; land fetchCards:todo ; land fetchCards:done ; tab archive ; land fetchCards:doing ; tab board ; land fetchCards:todo ; add Bravo 2 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; add Alpha 3 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; land fetchCards:done ; add Bravo 4 ; (move failed: locator.fill: Ti

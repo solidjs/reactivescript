@@ -1,0 +1,4 @@
+✗ HOLD an item added while the checklist reloads shows once
+    locator.click: Timeout 30000ms exceeded.
+
+0/1 passed
