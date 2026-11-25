@@ -27,8 +27,10 @@ Probe changes (judgement calls; Ryan 2026-11-25: "These are all fine"):
 
 Traced:
 - board opus-2 (13 seeds before B6): the detail sits in one loading region that reads all three columns, so it says
-  "loading" until every column has arrived. Ryan 2026-11-25: valid, the detail reads every column (B6). Left: seed 10
-  (card count vs progress) and seed 12 (Doing heading counts 2 beside 1 card), untraced.
+  "loading" until every column has arrived. Ryan 2026-11-25: valid, the detail reads every column (B6). Left: seed 12
+  (Doing heading counts 2 beside 1 card) = solidjs/solid#5202: a card moved back into Doing renders an empty row while
+  the columns re-ask (`repro/moved-row-empty-under-show-with-row-memo.spec.tsx`; 7-step trail: land todo; down #1; land
+  doing; land done; right #4; land move 1; left #4). Seed 10 (card count vs progress) in trace.
 - board opus-6 (7 seeds): page NotReadyError = solidjs/solid#5174 (a handler reading a ternary prop while its source
   re-asks; `repro/handler-reads-ternary-prop-during-reask.spec.tsx`). Minimal trail: land doing; land todo; left #3;
   land move; right #2.
