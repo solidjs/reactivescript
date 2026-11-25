@@ -1,0 +1,28 @@
+{
+  "name": "reactivescript-playground",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host --port 3020",
+    "build": "vite build",
+    "preview": "vite preview --host --port 3020",
+    "wasm": "sh scripts/build-wasm.sh",
+    "test": "node tests/playground.check.mjs",
+    "test:torx": "node tests/torx.check.mts",
+    "test:roundtrip": "node tests/roundtrip.check.mts"
+  },
+  "dependencies": {
+    "@solidjs/web": "2.0.3",
+    "highlight.js": "^11.11.1",
+    "prettier": "^3.10.1",
+    "solid-js": "2.0.3"
+  },
+  "devDependencies": {
+    "@solidjs/signals": "2.0.3",
+    "@solidjs/vite-plugin": "3.0.1",
+    "csstype": "3.2.3",
+    "playwright-core": "^1.56.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.8"
+  }
+}
