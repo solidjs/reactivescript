@@ -153,12 +153,15 @@ record argued each way; this is the decision.
   sink)` in the server's.
 - **CP-4c (The harness's, not the package's).** `reg`, `lookup`, `dget`,
   `dset` (a scenario's `handler` rows reach any live binding by name),
-  `api` and `jsError` (`./api` and its declared errors as test flights,
-  where a program imports the real module), `B.fetch` and `B.fail` (the
+  `api` and `jsError` (the unresolved `./api` test API and its declared
+  errors, MO-8c), `B.fetch` and `B.fail` (the
   scenario prelude), and `flights`, `lastKey`, `log`, `asyncError`,
   `frame` (what the runners observe). Compiled code calls them only in a
   conformance build — the compiler's option for running `scenarios/`
-  (CP-5); `ref/compile/emit.ts` always emits one.
+  (CP-5); `ref/compile/emit.ts` always emits one. The unresolved `./api`
+  fallback also serves the example apps with `createApp({ api })`.
+  Outside the flight-driving runners, `__rt.api(name)` without an injected
+  API throws `MISSING_TEST_API` at binding rather than making a test flight.
 
 ## CP-5 — `ref/` is the conformance suite
 
@@ -291,7 +294,11 @@ TY-1c), so every position has to cross between `.rx` and the projection.
   0-based columns in UTF-16 code units (LSP's), and byte offsets. The
   checker is line-precise (CN-1a), so a diagnostic's range is its line's:
   from the first node that starts on it to the furthest any such node
-  reaches on it (decision 9).
+  reaches on it (decision 9). `rxc check` uses the recovering source
+  parse (CP-8e) and reports a batch across the module graph: a source
+  with parse errors reports those, while other sources report their
+  checker diagnostics. It does not run TypeScript; use `rx-tsc` for
+  the projection's type errors (TY-1a).
 - **CP-8e (the editor).** An editor's parse recovers: a declaration that
   does not parse is a parse error on its line and is skipped to the next
   line that starts at column 0, and a missing expression is an empty name,

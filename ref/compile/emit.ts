@@ -4,12 +4,13 @@
 // (`v$x` the value or accessor, `w$x` a source's writer, `p$x` a companion `pre` memo). The decisions are the
 // oracle's (ref/oracle/lower.ts); this file only makes them at compile time.
 import type { Decl, Expr, Markup, Program, Stmt } from "../src/ast.ts";
-import { singleModule, type ModuleSet } from "../src/modules.ts";
+import { joinPath, singleModule, type ModuleSet } from "../src/modules.ts";
 import { innerCatches, nonTailAwaits, viewReaders } from "../src/awaits.ts";
 import { inferredAction } from "../src/infer.ts";
 import { transform } from "@solidjs/compiler";
 import { unwrapServer } from "../src/check.ts";
 import { isPrims } from "../src/prims.ts";
+import { pureGlobal } from "../src/pure-globals.ts";
 import type { Shape } from "../src/parse.ts";
 
 export class CompileError extends Error { name = "CompileError"; }
@@ -68,17 +69,24 @@ function deps(e: unknown, self: string, out = new Set<string>()): Set<string> {
 // ---------------------------------------------------------------- the module
 export function compile(p: Program, opts: { extraStmts?: Stmt[][] } = {}): string { return compileModules(singleModule(p), opts).files.get("main.mjs")!; }
 
+function relative(from: string, to: string): string {
+  const dir = from.split("/").slice(0, -1), parts = to.split("/");
+  let common = 0;
+  while (common < dir.length && dir[common] === parts[common]) common++;
+  return ("../".repeat(dir.length - common) || "./") + parts.slice(common).join("/");
+}
+
 /** 09 MO-1: one ES module per `.rx` module. A dependency's module is a factory over the app (`__rt.module` runs it once per app,
  *  the first time an importer instantiates — inside the mounted root, so its state is owned there); the entry's is `main`. */
-export function compileModules(set: ModuleSet, opts: { extraStmts?: Stmt[][] } = {}): { files: Map<string, string>; entry: string; css: string } {
+export function compileModules(set: ModuleSet, opts: { extraStmts?: Stmt[][]; bySource?: boolean; jsSpecifier?: (file: string, from: string) => string } = {}): { files: Map<string, string>; entry: string; css: string } {
   // MO-9: a module known by its signature is compiled on its own; its module is beside it, `x.rx` → `x.mjs`
   const out = (path: string) => path === set.entry ? "main.mjs" : set.order.includes(path) ? `m${set.order.indexOf(path)}.mjs` : `${path.split("/").pop()!.replace(/\.rx$/, "")}.mjs`;
-  const g = new Gen(usage([...set.programs.values()], opts.extraStmts), { set, out });
+  const g = new Gen(usage([...set.programs.values()], opts.extraStmts), { set, out, bySource: opts.bySource, jsSpecifier: opts.jsSpecifier });
   const files = new Map<string, string>();
   for (const path of set.order) {
     const p = set.programs.get(path)!; g.beginModule(path, p.decls);
     const deps = [...new Set(p.decls.flatMap(d => d.k === "import" && d.resolved ? [d.resolved] : []))];
-    const head = `// compiled by ReactiveScript ref/compile from ${path.split("/").pop()} — do not edit\n${deps.map(d => `import ${g.depVar(d)} from "./${out(d)}";`).join("\n")}${deps.length ? "\n" : ""}`;
+    const head = `// compiled by ReactiveScript ref/compile from ${path.split("/").pop()} — do not edit\n${deps.map(d => `import ${g.depVar(d)} from ${J(opts.bySource ? relative(path, d) : `./${out(d)}`)};`).join("\n")}${deps.length ? "\n" : ""}`;
     if (path === set.entry) { const body = g.block(p.decls, p.view, new Env(null), 2, undefined, true); files.set(out(path), `${head}${g.top.join("\n")}${g.top.length ? "\n" : ""}export default function main(__rt) {\n  const __B = __rt.B;\n  return () => {\n${body}\n  };\n}\n`); }
     else {
       const exported = p.decls.filter(d => (d as { exported?: boolean }).exported && "name" in d && d.k !== "typedecl").map(d => (d as { name: string }).name);
@@ -100,14 +108,21 @@ class Gen {
   serverNames = new Map<string, string>();              // a module-level server fn → its hoisted function
   private modDecls: Decl[] = [];
   private sfSeq = 0;
+  private localJS(from: string) { return this.mods?.set.jsFiles?.has(joinPath(this.file, from)); }
+  private realImport(from: string, name: string) {
+    return this.localJS(from) || ((!from.startsWith(".") || (this.mods?.bySource && from !== "./api")) && !BUILTINS.has(name) && name !== "log");
+  }
+  private jsDecl(d: Extract<Decl, { k: "import" }>, name: string) {
+    return d.declared ? this.mods?.set.declarations?.get(d.declared)?.find(x => x.kind !== "import" && x.name === name) : undefined;
+  }
   /** Begin a module: what a hoisted server function may name at module level (SF-3: imports, error classes, server fns). */
   beginModule(path: string, decls: Decl[]) {
     this.file = path; this.top = []; this.modDecls = decls; this.serverNames = new Map();
     for (const d of decls) if (d.k === "server" || (d.k === "eq" && unwrapServer(d.e))) this.serverNames.set(d.name, `sf$${d.name}`);
-    // a package's JS (\`@solidjs/web/server-functions\`): a real import at module level, where a hoisted server fn's wrappers are
-    for (const d of decls) if (d.k === "import" && !d.resolved && !d.from.startsWith(".")) {
-      const names = d.names.filter(n => !BUILTINS.has(n.name) && n.name !== "log");
-      if (names.length) this.top.push(`import { ${names.map(n => `${n.name} as w$${n.alias}`).join(", ")} } from ${J(d.from)};`);
+    // Real JS imports live at module level so a hoisted server function can read them.
+    for (const d of decls) if (d.k === "import" && !d.resolved) {
+      const names = d.names.filter(n => this.realImport(d.from, n.name) && this.jsDecl(d, n.name)?.kind !== "type");
+      if (names.length) this.top.push(`import { ${names.map(n => `${n.name} as w$${n.alias}`).join(", ")} } from ${J(this.mods?.jsSpecifier?.(path, d.from) ?? d.from)};`);
     }
   }
   /** 12 SF-7a: a server fn as Solid's \`"use server"\` function at module level — it may name only its parameters, its locals
@@ -120,7 +135,7 @@ class Gen {
     const chain = (x: Expr): string => {
       if (x.k === "serverfn") return this.serverHoist({ name, params: x.params, body: x.body }, true);
       if (x.k === "call" && x.f.k === "id") {
-        const imp = this.modDecls.find(d => d.k === "import" && !d.resolved && !d.from.startsWith(".") && d.names.some(n => n.alias === (x.f as { name: string }).name));
+        const imp = this.modDecls.find(d => d.k === "import" && !d.resolved && d.names.some(n => n.alias === (x.f as { name: string }).name && (this.realImport(d.from, n.name) || !d.from.startsWith("."))));
         if (!imp) throw new CompileError(`${name}: a server fn's wrapper is a package's function (here, ${x.f.name})`);
         return `w$${x.f.name}(${x.args.map(a => unwrapServer(a) ? chain(a) : a.k === "lit" ? J(a.v) : (() => { throw new CompileError(`${name}: a wrapper's other arguments are literals`); })()).join(", ")})`;
       }
@@ -134,8 +149,9 @@ class Gen {
     const env = new Env(null); const pre: string[] = [];
     for (const x of this.modDecls) {
       if (x.k === "import" && !x.resolved) for (const { name, alias } of x.names) {
+        if (this.jsDecl(x, name)?.kind === "type") continue;
+        if (this.realImport(x.from, name)) { env.vars.set(alias, { kind: "val", js: `w$${alias}` }); continue; }
         if (name === "log" || BUILTINS.has(name)) continue;
-        if (!x.from.startsWith(".")) { env.vars.set(alias, { kind: "val", js: `w$${alias}` }); continue; }   // a package's: module level
         env.vars.set(alias, { kind: "val", js: mg(alias) });
         pre.push(`const ${mg(alias)} = ${x.declaredErrors?.includes(name) ? `__rt.jsError(${J(name)})` : `__rt.api(${J(name)})`};`);
       }
@@ -151,8 +167,8 @@ class Gen {
     return f;
   }
   private styleHash: string | null = null;   // CSS-2: the scope class of the view being emitted
-  mods?: { set: ModuleSet; out: (path: string) => string };
-  constructor(u: Usage, mods?: { set: ModuleSet; out: (path: string) => string }) { this.u = u; this.mods = mods; }
+  private mods?: { set: ModuleSet; out: (path: string) => string; bySource?: boolean; jsSpecifier?: (file: string, from: string) => string };
+  constructor(u: Usage, mods?: Gen["mods"]) { this.u = u; this.mods = mods; }
   private modIndex(path: string) { const { order, signatures } = this.mods!.set; return [...order, ...(signatures?.keys() ?? [])].indexOf(path); }
   depVar(path: string) { return `__m${this.modIndex(path)}`; }
   /** An imported name's binding, from the exporting module's declaration (MO-3: a source is read-only here, so an accessor). */
@@ -227,7 +243,8 @@ class Gen {
     // MO-1: each .rx dependency instantiated (once per app), its exports bound by name
     for (const d of decls) if (d.k === "import" && d.resolved) {
       const iv = `__i${this.modIndex(d.resolved)}`;
-      if (!out.some(l => l.includes(`const ${iv} =`))) out.push(`${pad}const ${iv} = __rt.module(${J(this.mods!.out(d.resolved))}, ${this.depVar(d.resolved)});`);
+      const dep = this.depVar(d.resolved);
+      if (!out.some(l => l.includes(`const ${iv} =`))) out.push(`${pad}const ${iv} = __rt.module(${this.mods!.bySource ? dep : J(this.mods!.out(d.resolved))}, ${dep});`);
       for (const { name, alias } of d.names) {
         if (this.mods!.set.programs.get(d.resolved)?.decls.some(x => x.k === "typedecl" && x.name === name) || this.mods!.set.signatures?.get(d.resolved)?.exports.get(name)?.kind === "type") continue;   // a type binds nothing
         const ib = this.importBind(d.resolved, name, alias); env.vars.set(alias, ib); out.push(`${pad}const ${ib.js} = ${iv}[${J(name)}];`);
@@ -236,7 +253,7 @@ class Gen {
     // names first: hoisted functions and components; every other declaration is a const
     for (const d of decls) {
       if (d.k === "import" && d.resolved) continue;
-      if (d.k === "import") for (const { name, alias } of d.names) { const x = d.declared ? this.mods?.set.declarations?.get(d.declared)?.find(y => y.name === name) : undefined; env.vars.set(alias, x?.kind === "fn" && x.instantiates ? { kind: "jfn", js: mg(alias), refs: x.refs ?? [], shape: x.shape ?? "value" } : { kind: "val", js: mg(alias), client: d.side === "client" || d.declaredSide?.[name] === "client" }); }   // MO-10a
+      if (d.k === "import") for (const { name, alias } of d.names) { const x = this.jsDecl(d, name); if (x?.kind !== "type") env.vars.set(alias, x?.kind === "fn" && x.instantiates ? { kind: "jfn", js: mg(alias), refs: x.refs ?? [], shape: x.shape ?? "value" } : { kind: "val", js: mg(alias), client: d.side === "client" || d.declaredSide?.[name] === "client" }); }   // MO-10a
       if (d.k === "fn") env.vars.set(d.name, { kind: d.params.some(p => p.ref) || d.decls.length ? "ifn" : "fn", js: mg(d.name), fn: d });
       if (d.k === "component") env.vars.set(d.name, { kind: "comp", js: cm(d.name) });
       if (d.k === "action") env.vars.set(d.name, { kind: "act", js: mg(d.name) });
@@ -247,7 +264,8 @@ class Gen {
       if (d.k === "eq") { const jf = d.e.k === "call" && d.e.f.k === "id" ? env.lookup(d.e.f.name) : undefined; env.vars.set(d.name, { kind: "acc", js: mg(d.name), w: this.guessedEq(d) ? `w$${d.name}` : undefined, prev: this.u.prevOf.has(d.name) ? `p$${d.name}` : undefined, ...(jf?.kind === "jfn" ? { inst: `r$${d.name}`, shape: jf.shape } : {}) }); }
     }
     for (const d of decls) if (d.k === "import" && !d.resolved) for (const { name, alias } of d.names) {
-      const v = !d.from.startsWith(".") && !BUILTINS.has(name) && name !== "log" ? `w$${alias}` : name === "log" ? "__B.log" : d.declaredErrors?.includes(name) ? `__rt.jsError(${J(name)})` : BUILTINS.has(name) ? `__B.${name}` : d.from.endsWith("/api") ? `__rt.api(${J(name)})` : isPrims(d.from) ? `__rt.prim(${J(name)})` : null;   // MO-10: the prelude's Solid primitives
+      if (this.jsDecl(d, name)?.kind === "type") continue;
+      const v = this.realImport(d.from, name) ? `w$${alias}` : name === "log" ? "__B.log" : d.declaredErrors?.includes(name) ? `__rt.jsError(${J(name)})` : BUILTINS.has(name) ? `__B.${name}` : d.from === "./api" ? `__rt.api(${J(name)})` : isPrims(d.from) ? `__rt.prim(${J(name)})` : null;   // MO-10: the prelude's Solid primitives
       if (!v) throw new CompileError(`${name} from "${d.from}" is not in the scenario prelude`);
       out.push(`${pad}const ${mg(alias)} = ${v};\n${pad}__rt.reg(${J(alias)}, { value: ${mg(alias)} });`);
     }
@@ -480,7 +498,8 @@ class Gen {
         return `${go(e.f)}(${e.args.map(go).join(", ")})`;
       }
       case "arr": return `[${e.items.map(i => i.k === "spread" ? `...${go(i.e)}` : go(i)).join(", ")}]`;
-      case "rec": return `({ ${e.fields.map(f => "spread" in f ? `...${go(f.spread)}` : `${J(f.key)}: ${go(f.v)}`).join(", ")} })`;
+      case "as": return go(e.e);
+      case "rec": return `({ ${e.fields.map(f => "spread" in f ? `...${go(f.spread)}` : `${"computed" in f ? `[${go(f.computed)}]` : J(f.key)}: ${go(f.v)}`).join(", ")} })`;
       case "fn": {
         const inner = this.params(env, e.params); const ps = e.params.map(mg).join(", ");
         if (e.stmts && inferredAction(e.stmts)) return `(${ps}) => __rt.action(function* () {\n${this.stmts(e.stmts, inner, { imp: true, gen: true, dyn: ctx.dyn, effect: ctx.effect }, 1)}\n})()`;   // AC-1b: an inferred action lowers as `action { … }` does, to Solid's action()
@@ -503,6 +522,7 @@ class Gen {
     if (ctx.effect && /^\$\d+$/.test(name)) return `$p[${name.slice(1)}]`;
     const b = env.lookup(name);
     if (!b) {
+      if (pureGlobal(name)) return name;
       if (BUILTINS.has(name)) return `__B.${name}`;
       if (ctx.dyn) return name === "log" ? "__B.log" : ctx.imp ? `__rt.dget(${J(name)})` : `__rt.dget(${J(name)}, true)`;
       if (name === "log" && ctx.imp) return "__B.log";
@@ -581,7 +601,7 @@ class Gen {
       case "style": return "";                                                                 // CSS-4: removed; the stylesheet is the module's
       case "read": return `{__rt.show(${this.expr(m.e, env, re)})}`;
       case "el": {
-        if (m.tag === "") return this.markup(m.children, env, ind);
+        if (m.tag === "") return m.children.length ? this.markup(m.children, env, ind) : "{null}";
         if (/^[A-Z]/.test(m.tag)) {
           const b = env.lookup(m.tag); if (b?.kind !== "comp") throw new CompileError(`unknown component ${m.tag}`);
           const attrs = m.attrs.map(a => " " + this.attr(a.name, a.e, env)).join("");

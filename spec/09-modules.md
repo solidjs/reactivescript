@@ -164,6 +164,12 @@ export component Save(props: { v: unrendered action go catches(nothing) })
   `rejects(…)` defaults to `Error`. In every `.d.rx` — written for a JS
   module or printed for an `.rx` one — `pure fn` is pure, `fn` is io, and
   `action` is an action.
+  A JS declaration may use TypeScript type parameters, as in `export pure
+  fn identity<T>(value: T): T`, and private `type` or `interface`
+  declarations for types used in the file. In a JS declaration,
+  `rejects(A, B)` names the same rejection row as `rejects(A | B)`.
+  A value parameter may be optional, as in `export pure fn label(x?: string): string`.
+  This affects its TypeScript call signature only; it supplies no default.
 - **MO-8b.** With a declaration file, the file is the row, as a signature is
   for an `.rx` import (MO-4a): an import that names an undeclared export is
   `NOT_EXPORTED`; `pure` on the import must agree (`IMPORT_ROW_MISMATCH`
@@ -174,8 +180,37 @@ export component Save(props: { v: unrendered action go catches(nothing) })
   instead of at every import (S-module-2).
 - **MO-8c.** A JS import, relative (`./util.js`) or a package's, stays an
   ES import in the compiled module, for the bundler to resolve; no
-  `package.json` `#imports` alias is needed. The one exception is `./api`,
-  which is the app's injected API (`createApp({ api })`, CP-4).
+  `package.json` `#imports` alias is needed. For the scenarios and examples,
+  exactly `./api` can name the injected test API (`createApp({ api })`,
+  CP-4c), but only if there is no local implementation relative to the
+  importing file. A neighboring `api.js` or `api.ts` wins; an `api.d.rx`
+  declares the API's rows but is not itself an implementation.
+- **MO-8d.** An `export type` in a JS module's `.d.rx` binds no value.
+  Its name (including a local alias) appears in the type projection, but
+  not in the emitted JS import or runtime bindings. An import with only
+  such names does not load the JS module. The runtime compiler does not
+  read TypeScript types or infer which imports are types from their uses:
+  declare type exports in `.d.rx` to erase them. No `import type` form
+  is needed on an `.rx` import.
+- **MO-8e.** A declaration file may import types, so a signature names a
+  type declared elsewhere instead of copying it:
+
+  ```rx
+  import { Card, Route as R } from "./server"
+  export pure fn matches(c: Card, r: R): boolean
+  ```
+
+  Types only: `import { T, U as V } from "./x"` (`import type` is the same
+  words). No default, no `pure`, no `fails`, and it is not re-exported.
+  It binds no value and emits no JS. `./x` drops a `.js`, `.mjs` or `.ts`
+  extension, as an import of the JS module does (MO-8a). A path ending in
+  `.rx` is that module, and only an `export type` there; any other path is
+  `x.d.rx` when that file exists, otherwise `x.rx`. A missing file is
+  `MODULE_NOT_FOUND`. A name that file does not export as a type is
+  `NOT_EXPORTED`. A name that is a value (a `fn`) is `TYPE_IMPORT`. The
+  names are in scope for the rest of the file. An `.rx` import of those
+  names is still not `import type` (MO-8d): the declaration file imported
+  them so its signatures can say them.
 
 ## MO-9 — A signature read in place of its module
 
@@ -305,7 +340,8 @@ export component Search(props: { start: boolean, q: string }) {
 | `WRITE_TO_NON_SOURCE` (rule MO-2) | S | MO-2a |
 | `IMPORT_ROW_MISMATCH` | S | MO-4a |
 | `MODULE_CYCLE` | S | MO-5 |
-| `NOT_EXPORTED`, `MODULE_NOT_FOUND` | S | MO-6a; MO-8b for a declared JS module |
+| `NOT_EXPORTED`, `MODULE_NOT_FOUND` | S | MO-6a; MO-8b for a declared JS module; MO-8e for a type import in a `.d.rx` |
+| `TYPE_IMPORT` | S | MO-8e: a declaration file imported a value |
 | `CONTEXT_NOT_FOUND` across modules | S | MO-7, RG-7b |
 
 ## Implementation

@@ -3,6 +3,7 @@
 // This is the compiler's back half, run as an interpreter: every form maps to the primitive
 // its rule names (ST-1, ST-4c, ST-6c, AC-3 …). Unsupported shapes throw `Unsupported`.
 import { classMap } from "../src/style.ts";
+import { actionInput } from "../compile/action-input.ts";
 import { inferredAction } from "../src/infer.ts";
 import type { Decl, Expr, Markup, Program, Stmt } from "../src/ast.ts";
 import { createRenderer } from "@solidjs/universal";
@@ -18,6 +19,7 @@ import { makeErrorClass, isA, PANIC, wireCopy, wireFailure } from "../src/failur
 import { singleModule, type ModuleSet } from "../src/modules.ts";
 import { nonTailAwaits, viewReaders } from "../src/awaits.ts";
 import { unwrapServer } from "../src/check.ts";
+import { pureGlobal, pureGlobalValue } from "../src/pure-globals.ts";
 import { primsSolid, isPrims } from "../src/prims.ts";
 import type { Shape } from "../src/parse.ts";
 /** 12 SF-1d: Solid's server-function wrappers (\`GET\`, \`live\`, …) where there is no network: the function as it is (SF-7b). */
@@ -244,7 +246,7 @@ export class Oracle {
     for (const d of decls) {
       if (d.k === "import" && d.resolved) { const ms = this.moduleScopes.get(d.resolved); if (!ms) throw new Error(`MO-9: ${d.from} is known by its signature only: there is no body to run`); for (const { name, alias } of d.names) { const b = ms.vars.get(name); if (b) scope.vars.set(alias, b); } continue; }   // MO-1: the module's own bindings
       if (d.k === "eq") { const sf = unwrapServer(d.e); if (sf) this.serverNames.set(sf, d.name); }   // SF-1d
-      if (d.k === "import" && isPrims(d.from)) { const prims = primsSolid({ createSignal: createSignal as any, createMemo: createMemo as any }); for (const { name, alias } of d.names) { const x = this.declarations?.get(d.declared ?? "")?.find(y => y.name === name); if (!x || x.kind !== "fn" || !x.instantiates || !prims[name]) throw new Error(`${name} from "${d.from}" is not a declared primitive of the prelude`); scope.vars.set(alias, { k: "jfn", f: prims[name], refs: x.refs ?? [], shape: x.shape ?? "value" }); } continue; }   // MO-10: Solid primitives, as a library writes them
+      if (d.k === "import" && isPrims(d.from)) { const prims = primsSolid({ createSignal: createSignal as any, createMemo: createMemo as any }); for (const { name, alias } of d.names) { const x = this.declarations?.get(d.declared ?? "")?.find(y => y.kind !== "import" && y.name === name); if (!x || x.kind !== "fn" || !x.instantiates || !prims[name]) throw new Error(`${name} from "${d.from}" is not a declared primitive of the prelude`); scope.vars.set(alias, { k: "jfn", f: prims[name], refs: x.refs ?? [], shape: x.shape ?? "value" }); } continue; }   // MO-10: Solid primitives, as a library writes them
       if (d.k === "import") for (const { name, alias } of d.names) { const v = d.from === "@solidjs/web/server-functions" ? LOCAL_WRAPPERS[name] : name === "log" ? (...a: unknown[]) => { this.log.push(`log(${a.map(fmt).join(", ")})`); } : d.declaredErrors?.includes(name) ? makeErrorClass(name, ["message"], a => String(a[0] ?? name)) : BUILTINS[name] ?? (d.from.endsWith("/api") ? (...a: unknown[]) => { const fl = this.flight(`${name}:${a.map(fmt).join(",")}`); return process.env.ORACLE_PROMISES ? fl.first : fl; } : undefined); if (v === undefined) throw new Error(`${name} from "${d.from}" is not in the scenario prelude`); scope.vars.set(alias, { k: "const", value: v }); }
       if (d.k === "server") scope.vars.set(d.name, { k: "const", value: this.serverFn(d, scope) });
       if (d.k === "error") { const msg = d.msg; scope.vars.set(d.name, { k: "const", value: makeErrorClass(d.name, d.params, args => msg ? String(untrack(() => this.ev(msg, scope, new Map(d.params.map((p, i) => [p, args[i]] as const))))) : d.name) }); }   // R-f-1
@@ -451,7 +453,7 @@ export class Oracle {
       case "id": {
         if (env?.has(e.name)) return env.get(e.name);
         const b = scope.lookup(e.name);
-        if (!b) { if (e.name in BUILTINS) return BUILTINS[e.name]; throw new Error(`unbound ${e.name}`); }
+        if (!b) { if (pureGlobal(e.name)) return pureGlobalValue(e.name); if (e.name in BUILTINS) return BUILTINS[e.name]; throw new Error(`unbound ${e.name}`); }
         switch (b.k) {
           case "const": return b.value;
           case "sig": case "memo": case "store": {
@@ -500,7 +502,8 @@ export class Oracle {
         return BIN[e.op](l, r);
       }
       case "arr": { const out: unknown[] = []; for (const i of e.items) { if (i.k === "spread") out.push(...(this.ev(i.e, scope, env) as unknown[])); else out.push(this.ev(i, scope, env)); } return out; }
-      case "rec": { const o: Record<string, unknown> = {}; for (const f of e.fields) { if ("spread" in f) Object.assign(o, this.ev(f.spread, scope, env)); else o[f.key] = this.ev(f.v, scope, env); } return o; }
+      case "as": return this.ev(e.e, scope, env);
+      case "rec": { const o: Record<string, unknown> = {}; for (const f of e.fields) { if ("spread" in f) Object.assign(o, this.ev(f.spread, scope, env)); else if ("computed" in f) Object.defineProperty(o, this.ev(f.computed, scope, env) as PropertyKey, { value: this.ev(f.v, scope, env), enumerable: true, configurable: true, writable: true }); else o[f.key] = this.ev(f.v, scope, env); } return o; }
       case "fn": if (e.stmts && inferredAction(e.stmts)) return this.lowerAction(e.params, e.stmts, scope, env);   // AC-1b
         return (...args: unknown[]) => { const en = new Map(env); e.params.forEach((p, i) => en.set(p, args[i])); return e.stmts ? this.runStmts(e.stmts, scope, en) : this.ev(e.body, scope, en); };
       case "stylemap": return classMap(e.css);                      // 07 CSS-5
@@ -581,7 +584,7 @@ export class Oracle {
       env.set("log", (...a: unknown[]) => { self.log.push(`log(${a.map(fmt).join(", ")})`); });
       const r = yield* self.block(body, scope, env); return r ? r.value : undefined;
     });
-    return (...args: unknown[]) => { const p = run(...args); p.catch(e => { self.asyncError = e; }); return p; };
+    return (...args: unknown[]) => { const p = run(...untrack(() => actionInput(args, $TARGET))); p.catch(e => { self.asyncError = e; }); return p; };
   }
   /** 12 SF-7b: a server function as the client sees it — a call is a flight. The body runs in place (its generator driven by
    *  promises, not by an action: it is no change of the client's), behind a wire that copies arguments and result (SF-6a) and

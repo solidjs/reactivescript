@@ -9,6 +9,7 @@ const JS_APIS = /\b(useState|useReducer|useMemo|useCallback|useEffect|useRef|cre
  *  `src/parse.rs` `hint` is the same function. */
 export function hint(src: string, i: number, msg: string): [string, string] | null {
   const rest = src.slice(i);
+  if (msg === "action parameter default") return ["ACTION_PARAMETER_DEFAULT", "an action takes one argument per parameter (AC-1f); remove the default and pass the value at the call"];
   const at = rest.length && !/^\s*$/.test(rest.split("\n")[0]) ? i : src.slice(0, i).trimEnd().length - 1;
   const p = Math.max(0, at);
   const lineStart = (k: number) => src.slice(0, k).lastIndexOf("\n") + 1;
@@ -29,6 +30,10 @@ export function hint(src: string, i: number, msg: string): [string, string] | nu
   const api = JS_APIS.exec(line);
   if (api)
     return ["JS_API", `\`${api[1]}\` is not .rx: state is \`source x := …\`, a value computed from others is \`x = …\`, a side effect is \`effect (x) { … }\``];
+  if (msg === "expression" && rest.startsWith("<") && before.includes("?"))
+    return ["JSX_TERNARY", "markup is not an expression: write `{if c { <span/> } else { \"\" }}`, not `c ? <span/> : \"\"`"];
+  if (msg === "in" && /^\s*,/.test(rest) && /\bfor\s+[A-Za-z_$]/.test(line))
+    return ["FOR_INDEX", "`for` binds one name: `for x in xs { … }`. The index is `xs.indexOf(x)` in the body, or map the list first: `rows = map(xs, (x, i) => ({ x, i }))`"];
   return null;
 }
 let viewAt = 0;
@@ -84,7 +89,7 @@ class Cursor {
   }
 }
 
-/** A TypeScript type, kept as text: balanced up to a depth-0 stop (`=`, `:=`, `,`, `)`, `=>`, `{` when `braceStops`). 07 §2. */
+/** A TypeScript type, kept as text: balanced up to a depth-0 stop (`=`, `:=`, `,`, `)`, `}`, `=>`, `{` when `braceStops`). 07 §2. `}` at depth 0 closes the block or JSX expression around an `as`. */
 /** A type's text, up to where the declaration goes on. `=>` inside brackets is a function type, as it is anywhere in a
  *  type alias (`arrows`); elsewhere at the top it starts a body (`fn f(): T => …`). */
 function parseType(c: Cursor, braceStops = false, arrows = false): string {
@@ -93,7 +98,7 @@ function parseType(c: Cursor, braceStops = false, arrows = false): string {
     const ch = c.peek();
     if (c.startsWith("=>") && (depth > 0 || arrows)) { c.i += 2; continue; }
     if (depth === 0) {
-      if (c.startsWith("//") || c.startsWith("=>") || c.startsWith(":=") || ch === "=" || ch === "," || ch === ")" || ch === ";" || ch === "\n" || (braceStops && ch === "{")) break;
+      if (c.startsWith("//") || c.startsWith("=>") || c.startsWith(":=") || ch === "=" || ch === "," || ch === ")" || ch === "}" || ch === ";" || ch === "\n" || (braceStops && ch === "{")) break;
     }
     if (ch === "(" || ch === "[" || ch === "{" || ch === "<") depth++;
     else if (ch === ")" || ch === "]" || ch === "}" || ch === ">") depth--;
@@ -106,9 +111,9 @@ function splitKey(type: string | undefined): { type?: string; key?: string } { c
 function optType(c: Cursor, braceStops = false): string | undefined { c.ws(false); if (c.peek() === ":" && c.peek(1) !== "=") { c.i++; c.ws(); return parseType(c, braceStops); } return undefined; }
 
 /** R-f: `A | B` — error class names. `Error` (or TS's `unknown`/`any`) is every failure: undefined. */
-function parseClasses(c: Cursor): string[] | undefined {
+function parseClasses(c: Cursor, commas = false): string[] | undefined {
   const out: string[] = [];
-  for (;;) { c.ws(); out.push(c.ident() ?? c.fail("error class")); c.ws(false); if (c.peek() === "|" && c.peek(1) !== "|") { c.i++; continue; } break; }
+  for (;;) { c.ws(); out.push(c.ident() ?? c.fail("error class")); c.ws(false); if ((c.peek() === "|" && c.peek(1) !== "|") || (commas && c.peek() === ",")) { c.i++; continue; } break; }
   return out.some(n => n === "Error" || n === "unknown" || n === "any") ? undefined : out;
 }
 
@@ -132,32 +137,78 @@ export function parseProgram(src: string): Program {
 /** MO-8: a declaration file (`api.d.rx`) for a JS module — what each export is, in rows: `export pure fn f(a) rejects(A | B)`,
  *  `export fn g(a)` (io: dirty is the default, R-io-4), `export error NotFound` (a JS class that is an error class), `export type T`. */
 export type JsDecl =
-  | { kind: "fn"; name: string; pure: boolean; params: string[]; rejects?: string[]; line: number; side?: "server" | "client"; ptypes?: (string | undefined)[]; ret?: string; refs?: boolean[]; shape?: Shape; instantiates?: boolean }   // side: 12 SF-5; types: text, for TY (types/), `ref` taken out; MO-10: refs (ref parameters), shape (what its result is), instantiates (written, or inferred from a ref)
+  | { kind: "fn"; name: string; pure: boolean; params: string[]; generics?: string; rejects?: string[]; line: number; side?: "server" | "client"; ptypes?: (string | undefined)[]; ret?: string; refs?: boolean[]; shape?: Shape; instantiates?: boolean }   // side: 12 SF-5; types: text, for TY (types/), `ref` taken out; MO-10: refs (ref parameters), shape (what its result is), instantiates (written, or inferred from a ref)
   | { kind: "error"; name: string; line: number }
-  | { kind: "type"; name: string; line: number; text?: string };
+  | { kind: "type"; name: string; line: number; text?: string; exported: boolean }
+  | { kind: "import"; names: { name: string; alias: string }[]; from: string; line: number; target?: string; rx?: boolean };   // MO-8e: types only; target/rx filled by the loader
+function typeParams(c: Cursor): string | undefined {
+  const start = c.i;
+  if (!c.eat("<")) return;
+  let depth = 1;
+  while (!c.eof()) {
+    if (c.eat("=>")) continue;
+    if (c.eat("<")) depth++;
+    else if (c.eat(">")) { if (--depth === 0) return c.src.slice(start, c.i); }
+    else if (c.peek() === "'" || c.peek() === '"' || c.peek() === "`") {
+      const quote = c.peek(); c.i++;
+      while (!c.eof() && c.peek() !== quote) { if (c.eat("\\")) c.i++; c.i++; }
+      c.expect(quote);
+    } else c.i++;
+  }
+  c.fail("expected '>' to end type parameters");
+}
+const DECL_IMPORT = "a declaration file imports types only: `import { T, U as V } from \"./x\"`";
+/** MO-8e: `import { T, U as V } from "./x"` in a `.d.rx` — types only, resolved by the loader. */
+function parseDeclImport(c: Cursor, line: number): JsDecl {
+  c.keyword("import"); c.ws();
+  if (c.keyword("type")) c.ws();
+  if (c.keyword("pure") || c.keyword("server") || c.keyword("client") || !c.startsWith("{")) c.fail(DECL_IMPORT);
+  c.expect("{"); c.ws();
+  const names: { name: string; alias: string }[] = [];
+  while (!c.startsWith("}")) {
+    const name = c.ident() ?? c.fail("import name"); c.ws();
+    let alias = name;
+    if (c.keyword("as")) { c.ws(); alias = c.ident() ?? c.fail("alias"); c.ws(); }
+    names.push({ name, alias });
+    if (!c.eat(",")) break; c.ws();
+  }
+  if (!names.length) c.fail("import name");
+  c.expect("}"); c.ws();
+  if (!c.keyword("from")) c.fail("from");
+  c.ws();
+  const from = parsePrimary(c); if (from.k !== "lit" || typeof from.v !== "string") c.fail("module path");
+  const save = c.i; c.ws(false);
+  if (c.keyword("fails")) c.fail(DECL_IMPORT);
+  c.i = save;
+  return { kind: "import", names, from: from.v, line };
+}
 export function parseDeclarations(src: string): JsDecl[] {
   const c = new Cursor(src); const out: JsDecl[] = [];
   for (;;) {
-    c.ws(); if (c.eof()) return out;
+    c.ws(); if (c.eat(";")) continue; if (c.eof()) return out;
     const line = c.line;
-    if (!c.keyword("export")) c.fail("a declaration file declares exports: `export pure fn …`, `export fn …`, `export error …`, `export type …`");
+    const exported = c.keyword("export");
     c.ws();
-    if (c.startsWith("type") || c.startsWith("interface")) { const t0 = c.i; c.keyword("type") || c.keyword("interface"); c.ws(); const name = c.ident() ?? c.fail("type name"); c.ws(); if (c.eat("=")) { c.ws(); parseType(c, false, true); } else if (c.startsWith("{")) { let depth = 0; do { if (c.peek() === "{") depth++; if (c.peek() === "}") depth--; c.i++; } while (!c.eof() && depth); } out.push({ kind: "type", name, line, text: c.src.slice(t0, c.i) }); continue; }
+    if (!exported && c.peekIdent() === "import") { out.push(parseDeclImport(c, line)); continue; }
+    if (exported && c.peekIdent() === "import") c.fail("a declaration file imports types for its signatures; it does not re-export (`import { T } from \"./x\"`)");
+    if (c.peekIdent() === "type" || c.peekIdent() === "interface") { const t0 = c.i; c.keyword("type") || c.keyword("interface"); c.ws(); const name = c.ident() ?? c.fail("type name"); c.ws(); typeParams(c); c.ws(); if (c.eat("=")) { c.ws(); parseType(c, false, true); } else if (c.startsWith("{")) { let depth = 0; do { if (c.peek() === "{") depth++; if (c.peek() === "}") depth--; c.i++; } while (!c.eof() && depth); } out.push({ kind: "type", name, line, text: c.src.slice(t0, c.i), exported }); continue; }
+    if (!exported) c.fail("a declaration file declares exports: `export pure fn …`, `export fn …`, `export error …`, `export type …`, or `import { T } from \"./x\"`");
     if (c.keyword("error")) { c.ws(); const name = c.ident() ?? c.fail("error class name"); out.push({ kind: "error", name, line }); continue; }
     const side = c.keyword("server") ? "server" as const : c.keyword("client") ? "client" as const : undefined; c.ws();   // 12 SF-5: runs on one side only
     const pure = c.keyword("pure"); c.ws();
+    if (c.keyword("const")) c.fail("a .d.rx cannot declare a const export; expose a stable value through `export pure fn getValue(): T`");
     if (!c.keyword("fn")) c.fail("fn");
-    c.ws(); const name = c.ident() ?? c.fail("fn name"); c.ws(); c.expect("("); c.ws();
+    c.ws(); const name = c.ident() ?? c.fail("fn name"); c.ws(); const generics = typeParams(c); c.ws(); c.expect("("); c.ws();
     const params: string[] = []; const ptypes: (string | undefined)[] = []; const refs: boolean[] = [];
-    while (!c.startsWith(")")) { const r = c.keyword("ref"); if (r) c.ws(); refs.push(r); params.push(c.ident() ?? c.fail("param")); c.ws(false); ptypes.push(c.peek() === ":" ? (c.i++, c.ws(), parseType(c, false, true)) : undefined); c.ws(); if (!c.eat(",")) break; c.ws(); }   // MO-10a: a ref parameter takes an accessor
+    while (!c.startsWith(")")) { const r = c.keyword("ref"); if (r) c.ws(); refs.push(r); const p = c.ident() ?? c.fail("param"); c.ws(false); const optional = c.eat("?"); if (optional) { c.ws(false); if (r || c.peek() !== ":") c.fail("an optional parameter is a value parameter written `x?: T`"); } params.push(optional ? `${p}?` : p); ptypes.push(c.peek() === ":" ? (c.i++, c.ws(), parseType(c, false, true)) : undefined); c.ws(); if (!c.eat(",")) break; c.ws(); }   // MO-10a: a ref parameter takes an accessor
     c.expect(")");
     const save = c.i; c.ws(false); let ret: string | undefined; let shape: Shape | undefined;
     if (c.peek() === ":" ) { c.i++; c.ws(); const t = c.src.slice(c.i).split("\n")[0]; const r = /\brejects\(|\binstantiates\b/.exec(t); const raw = (r ? t.slice(0, r.index) : t).replace(/\/\/.*$/, "").trim(); shape = raw ? shapeOf(raw) : undefined; ret = raw.replace(/\bref\s+/g, "") || undefined; c.i += r ? r.index : t.length; } else c.i = save;   // MO-10b: `ref T` is an accessor, read as T
     c.ws(false); let rejects: string[] | undefined;
-    if (c.keyword("rejects")) { c.ws(); c.expect("("); rejects = parseClasses(c) ?? ["Error"]; c.ws(); c.expect(")"); }
+    if (c.keyword("rejects")) { c.ws(); c.expect("("); rejects = parseClasses(c, true) ?? ["Error"]; c.ws(); c.expect(")"); }
     c.ws(false); const written = c.keyword("instantiates");
     const instantiates = written || refs.some(x => x) || shapeHasRef(shape);   // MO-10a: inferred from a ref on either side
-    out.push({ kind: "fn", name, pure, params, rejects, line, ptypes, ret, ...(side ? { side } : {}), ...(instantiates ? { refs, shape: shape ?? "value", instantiates } : {}) });
+    out.push({ kind: "fn", name, pure, params, generics, rejects, line, ptypes, ret, ...(side ? { side } : {}), ...(instantiates ? { refs, shape: shape ?? "value", instantiates } : {}) });
   }
 }
 
@@ -265,6 +316,7 @@ function parseDecl(c: Cursor): Decl {
     if (c.keyword("default")) { c.ws(); const d = parseDecl(c); if (d.k !== "component") c.fail("export default: only a component is a module's default export (the app's entry, MO-1c)"); d.exported = true; d.isDefault = true; return d; }
     const d = parseDecl(c); if (d.k === "import" || d.k === "effect" || d.k === "provide") c.fail("export of a non-declaration"); (d as { exported?: boolean }).exported = true; return d; }
   if (c.keyword("import")) {                                           // 07 §1: `import pure? { a, b as c } from "m"` / `import X from "m"`
+    const start = c.i; c.ws(); if (c.keyword("type")) { c.ws(); if (c.startsWith("{")) c.fail("declare the type with `export type` in the module's .d.rx, then use `import { T }` in .rx"); } c.i = start;
     c.ws(); const side = /^(server|client)\s+(pure\b|\{)/.test(c.src.slice(c.i)) ? (c.keyword("server") ? "server" as const : (c.keyword("client"), "client" as const)) : undefined; c.ws();   // 12 SF-5: `import server pure { q }`
     const pure = c.keyword("pure"); c.ws();
     const names: { name: string; alias: string }[] = [];
@@ -315,7 +367,7 @@ function parseDecl(c: Cursor): Decl {
   if (c.keyword("action")) {
     c.ws(); const name = c.ident() ?? c.fail("action name"); c.ws(); c.expect("("); c.ws();
     const params: string[] = []; const ptypes: (string | undefined)[] = [];
-    while (!c.startsWith(")")) { params.push(c.ident() ?? c.fail("param")); ptypes.push(optType(c)); c.ws(); if (!c.eat(",")) break; c.ws(); }
+    while (!c.startsWith(")")) { params.push(c.ident() ?? c.fail("param")); ptypes.push(optType(c)); c.ws(); if (c.startsWith("=")) c.fail("action parameter default"); if (!c.eat(",")) break; c.ws(); }
     c.expect(")"); c.ws();
     return { k: "action", name, params, ptypes, body: parseBlock(c), line };
   }
@@ -478,8 +530,22 @@ function parseExprNoCatch(c: Cursor): Expr {
       c.expect("=>"); c.ws();
       if (c.peek() === "{") {                                        // `=> { … }`: a statement body (imperative scope) unless it reads as a record literal
         const at = c.i;
-        try { const stmts = parseBlock(c); if (stmts.some(st => !(st.k === "expr" && st.e.k === "id"))) return { k: "fn", params, body: { k: "lit", v: undefined }, stmts }; } catch (e) { if (!(e instanceof ParseError)) throw e; }
+        let stmtErr: ParseError | undefined;
+        try { const stmts = parseBlock(c); if (stmts.some(st => !(st.k === "expr" && st.e.k === "id"))) return { k: "fn", params, body: { k: "lit", v: undefined }, stmts }; }
+        catch (e) { if (!(e instanceof ParseError)) throw e; stmtErr = e; }
         c.i = at;
+        // A handler is a statement body. If that reading fails and the record reading does too, report the statement
+        // error — the record reading fails at the first `let` and the hint then blames a local that is in a handler.
+        try { return { k: "fn", params, body: parseExpr(c) }; }
+        catch (e) {
+          if (!(e instanceof ParseError)) throw e;
+          // The statement error wins when it names the habit. Otherwise the expression error does (`n++`), except
+          // JS_LOCAL, which the record reading blames on a `let` that is already in the handler.
+          if (stmtErr && stmtErr.code !== "PARSE") throw stmtErr;
+          if (e.code !== "PARSE" && e.code !== "JS_LOCAL") throw e;
+          if (stmtErr) throw stmtErr;
+          throw e;
+        }
       }
       return { k: "fn", params, body: parseExpr(c) };
     }
@@ -508,11 +574,38 @@ function parseBin(c: Cursor, lvl: number): Expr {
   let l = parseBin(c, lvl + 1);
   for (;;) {
     c.ws(false);
+    if (lvl === 4 && c.keyword("as")) {
+      c.ws(); l = { k: "as", e: l, ty: assertionType(c) };
+      continue;
+    }
     const op = LEVELS[lvl].find(o => c.startsWith(o) && !(o === "-" && c.peek(1) === ">"));
     if (!op) return l;
     c.i += op.length; c.ws();
     l = { k: "bin", op: OP_ALIAS[op] ?? op, l, r: parseBin(c, lvl + 1) };
   }
+}
+/** A type assertion ends at the surrounding expression's delimiter, not at a nested type delimiter. */
+function assertionType(c: Cursor): string {
+  const start = c.i; let end = start; const stack: string[] = [];
+  while (!c.eof()) {
+    const ch = c.peek();
+    if (!stack.length && (/[,\n;:)=\]}?+*/%!&<>-]/.test(ch) && !(ch === "&" && c.peek(1) !== "&") || c.startsWith("||") || c.peekIdent() === "as" || c.peekIdent() === "catch")) {
+      if (ch !== "<") break;
+      try { typeParams(c); end = c.i; continue; } catch (e) { if (!(e instanceof ParseError)) throw e; c.i = end; break; }
+    }
+    if (c.ident() !== null) { end = c.i; continue; }
+    if (c.startsWith("=>") && stack.length) { c.i += 2; end = c.i; continue; }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      c.i++; while (!c.eof() && c.peek() !== ch) { if (c.eat("\\")) c.i++; c.i++; } c.expect(ch);
+    } else {
+      if (ch === "(" || ch === "[" || ch === "{" || ch === "<") stack.push(({ "(": ")", "[": "]", "{": "}", "<": ">" })[ch]!);
+      else if (stack.at(-1) === ch) stack.pop();
+      c.i++;
+    }
+    if (!/\s/.test(ch)) end = c.i;
+  }
+  if (end === start || stack.length) c.fail("type after `as`");
+  c.i = end; return c.src.slice(start, end);
 }
 function parseUnary(c: Cursor): Expr {
   c.ws();
@@ -538,6 +631,8 @@ function parseUnary(c: Cursor): Expr {
 function parsePostfix(c: Cursor): Expr {
   let e = parsePrimary(c);
   for (;;) {
+    const save = c.i; c.ws();
+    if (!c.startsWith(".") && !c.startsWith("?.")) c.i = save;
     if (c.eat("?.")) { if (c.peek() === "[") { c.i++; c.ws(); const i = parseExpr(c); c.ws(); c.expect("]"); e = { k: "index", o: e, i, opt: true }; } else e = { k: "member", o: e, p: c.ident() ?? c.fail("member"), opt: true }; }
     else if (c.eat(".")) e = { k: "member", o: e, p: c.ident() ?? c.fail("member") };
     else if (c.peek() === "[") { c.i++; c.ws(); const i = parseExpr(c); c.ws(); c.expect("]"); e = { k: "index", o: e, i }; }
@@ -547,6 +642,50 @@ function parsePostfix(c: Cursor): Expr {
       c.expect(")"); e = { k: "call", f: e, args };
     } else return e;
   }
+}
+/** A quoted string or template's cooked escape (07 §3). */
+function stringEscape(c: Cursor): string {
+  c.i++; // backslash
+  if (c.eof()) c.fail("unterminated string escape");
+  const ch = c.peek(); c.i++;
+  const hex = (count: number) => {
+    const digits = c.src.slice(c.i, c.i + count);
+    if (digits.length !== count || !/^[0-9a-f]+$/i.test(digits)) c.fail("expected hex digits in string escape");
+    c.i += count;
+    return parseInt(digits, 16);
+  };
+  switch (ch) {
+    case "n": return "\n";
+    case "r": return "\r";
+    case "t": return "\t";
+    case "b": return "\b";
+    case "f": return "\f";
+    case "v": return "\v";
+    case "\r": c.eat("\n"); return "";
+    case "\n": case "\u2028": case "\u2029": return "";
+    case "x": return String.fromCharCode(hex(2));
+    case "u": {
+      let cp: number;
+      if (c.eat("{")) {
+        const digits = /^[0-9a-f]+/i.exec(c.src.slice(c.i))?.[0];
+        if (!digits) c.fail("expected hex digits in string escape");
+        c.i += digits.length; c.expect("}");
+        cp = parseInt(digits, 16);
+      } else {
+        cp = hex(4);
+        if (cp >= 0xd800 && cp <= 0xdbff && c.eat("\\u")) {
+          const low = hex(4);
+          if (low < 0xdc00 || low > 0xdfff) c.fail("invalid Unicode scalar in string escape");
+          cp = 0x10000 + ((cp - 0xd800) << 10) + low - 0xdc00;
+        }
+      }
+      if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) c.fail("invalid Unicode scalar in string escape");
+      return String.fromCodePoint(cp);
+    }
+    case "0": if (!/^[0-9]$/.test(c.peek())) return "\0";
+  }
+  if (/^[0-9]$/.test(ch)) c.fail("legacy numeric string escape");
+  return ch;
 }
 function parsePrimary(c: Cursor): Expr {
   c.ws();
@@ -567,14 +706,18 @@ function parsePrimary(c: Cursor): Expr {
     c.i++; const parts: (string | Expr)[] = []; let s = "";
     while (!c.eof() && c.peek() !== "`") {
       if (c.startsWith("${")) { c.i += 2; if (s) parts.push(s); s = ""; c.ws(); parts.push(parseExpr(c)); c.ws(); c.expect("}"); continue; }
-      if (c.peek() === "\\") c.i++;
-      s += c.peek(); c.i++;
+      if (c.peek() === "\\") s += stringEscape(c);
+      else if (c.eat("\r")) { c.eat("\n"); s += "\n"; }
+      else { s += c.peek(); c.i++; }
     }
     c.expect("`"); if (s || !parts.length) parts.push(s); return { k: "tpl", parts };
   }
   if (ch === '"' || ch === "'") {
     c.i++; let s = "";
-    while (!c.eof() && c.peek() !== ch) { if (c.peek() === "\\") { c.i++; } s += c.peek(); c.i++; }
+    while (!c.eof() && c.peek() !== ch) {
+      if (c.peek() === "\\") s += stringEscape(c);
+      else { s += c.peek(); c.i++; }
+    }
     c.expect(ch); return { k: "lit", v: s };
   }
   const num = /^\d[\d_]*(\.\d+)?/.exec(c.src.slice(c.i));
@@ -586,9 +729,13 @@ function parsePrimary(c: Cursor): Expr {
     c.expect("]"); return { k: "arr", items };
   }
   if (c.eat("{")) {
-    c.ws(); const fields: ({ key: string; v: Expr } | { spread: Expr })[] = [];
+    c.ws(); const fields: Extract<Expr, { k: "rec" }>["fields"] = [];
     while (!c.startsWith("}")) {
       if (c.eat("...")) { c.ws(); fields.push({ spread: parseExpr(c) }); c.ws(); if (!c.eat(",")) break; c.ws(); continue; }
+      if (c.eat("[")) {
+        const computed = parseExpr(c); c.ws(); c.expect("]"); c.ws(); c.expect(":");
+        fields.push({ computed, v: parseExpr(c) }); c.ws(); if (!c.eat(",")) break; c.ws(); continue;
+      }
       const key = c.ident() ?? (c.peek() === '"' || c.peek() === "'" ? String((parsePrimary(c) as { v: unknown }).v) : c.fail("field")); c.ws();
       if (c.eat(":")) { c.ws(); fields.push({ key, v: parseExpr(c) }); } else fields.push({ key, v: { k: "id", name: key } });
       c.ws(); if (!c.eat(",")) break; c.ws();
@@ -609,13 +756,8 @@ function parsePrimary(c: Cursor): Expr {
 function parseMarkup(c: Cursor, closeTag: string | null): Markup[] {
   const out: Markup[] = [];
   const inElement = closeTag !== null && closeTag !== "}";
-  let broke = false;   // JSX whitespace (07: elements are JSX): whitespace that holds a line break is not text — except between two text runs, which it joins with one space
   for (;;) {
-    if (inElement) {
-      let s = ""; while (!c.eof() && " \t\r\n".includes(c.peek())) { s += c.peek(); c.i++; }
-      broke = s.includes("\n");
-      if (s && !broke && !c.startsWith(`</${closeTag}>`) && out.length) out.push({ k: "text", s: " " });   // same-line whitespace between nodes is a space
-    } else c.ws();
+    if (!inElement) c.ws();
     if (c.eof()) { if (closeTag !== null) c.fail(`expected </${closeTag}>`); return out; }
     if (closeTag !== null && closeTag !== "}" && c.startsWith(`</${closeTag}>`)) { c.i += closeTag.length + 3; return out; }   // `""` is a fragment's close tag
     if (closeTag === "}" && c.startsWith("}")) { c.i++; return out; }
@@ -629,17 +771,23 @@ function parseMarkup(c: Cursor, closeTag: string | null): Markup[] {
     }
     if (!inElement) { const ctl = parseControl(c); if (ctl) { out.push({ ...ctl, line }); continue; } }
     if (closeTag === null && looksLikeDecl(c)) c.fail("declaration after markup: a block is declarations, then its view");
-    // text up to < { } or newline; a line's trailing whitespace is not text (JSX)
+    // Normalize a whole JSX text child, not one line at a time.
+    const start = c.i;
     let s = "";
-    while (!c.eof() && !"<{}\n".includes(c.peek())) { s += c.peek(); c.i++; }
-    if (c.peek() === "\n" || c.eof()) s = s.replace(/[ \t\r]+$/, "");
+    while (!c.eof() && !(inElement ? "<{}" : "<{}\n").includes(c.peek())) { s += c.peek(); c.i++; }
     if (!inElement) {
       // outside an element, bare text is not markup: a block is declarations, then markup
-      if (s.trim() === "") { if (c.peek() === "\n") c.i++; continue; }
+      if (s.trim() === "" && c.i > start) continue;
       if (s.includes(":=")) c.fail("W-2: write in reactive scope (no statement position)");
       c.fail("expected a declaration or markup");
     }
-    if (broke && out.length && out[out.length - 1].k === "text") out.push({ k: "text", s: " " });   // text on two lines: one space between
+    if (c.i === start) c.fail("expected a declaration or markup");
+    // Solid's trim_jsx_text: drop CR, continuation indentation and empty lines,
+    // then collapse runs. A same-line space is text, even at an element edge.
+    s = s.replace(/\r/g, "");
+    if (s.includes("\n")) s = s.split("\n").map((l, i) => i ? l.replace(/^\p{White_Space}+/u, "") : l)
+      .filter(l => /\P{White_Space}/u.test(l)).join(" ");
+    s = s.replace(/\p{White_Space}+/gu, " ");
     if (s) out.push({ k: "text", s });
   }
 }

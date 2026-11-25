@@ -82,5 +82,31 @@ const decl = run(
 );
 check("a .d.rx in include passes", decl.status === 0 && decl.out.trim() === "", decl);
 
+// TY-4b: the sibling .ts is what the bundler runs; the .d.rx is what .rx is checked against.
+// createHash's implementation returns Accessor<string>; .d.rx says `ref string`, which .rx reads as string.
+const refWin = run(
+  { include: ["."] },
+  { file: "hash.d.rx", text: () => "export pure fn createHash(): ref string\nexport pure fn createDebounced(ref source: string, ms: number): ref string\n" },
+  { file: "hash.ts", text: () => "import { type Accessor, createSignal } from 'solid-js';\nexport function createHash(): Accessor<string> { return createSignal('')[0]; }\nexport function createDebounced(source: Accessor<string>, _ms: number): Accessor<string> { return source; }\n" },
+  { file: "main.rx", text: () => 'import pure { createHash, createDebounced } from "./hash"\nexport default component App() {\n  source q := ""\n  hash = createHash()\n  h = hash.trim()\n  d = createDebounced(q, 10)\n  <p>{h}{d}</p>\n}\n' },
+);
+check("a .d.rx wins over the sibling .ts (ref is string, not Accessor)", refWin.status === 0 && refWin.out.trim() === "", refWin);
+
+// MO-8e/TY-4b: an imported type comes from the other .d.rx, not its implementation.
+const sharedTypes = [
+  { file: "shared.d.rx", text: () => "export type Label = { text: string }\n" },
+  { file: "shared.ts", text: () => "export type Label = number;\n" },
+  { file: "labels.d.rx", text: () => 'import { Label as TextLabel } from "./shared"\nexport pure fn labelText(x?: TextLabel): string\n' },
+  { file: "labels.js", text: () => "export const labelText = x => x?.text ?? '';\n" },
+];
+const labels = value => ({ file: "main.rx", text: () =>
+  `import { labelText } from "./labels"\nexport default component App() { <p>{labelText(${value})}</p> }\n` });
+const declaredType = run(...sharedTypes, labels('{ text: "ok" }'));
+check("a .d.rx can import an aliased type from another .d.rx", declaredType.status === 0 && declaredType.out.trim() === "", declaredType);
+const omitted = run(...sharedTypes, labels(""));
+check("an optional .d.rx parameter can be omitted", omitted.status === 0 && omitted.out.trim() === "", omitted);
+const wrongType = run(...sharedTypes, labels("123"));
+check("the imported .d.rx type rejects the sibling TS type", wrongType.status !== 0 && /main\.rx\(2,\d+\): error TS2345/.test(wrongType.out), wrongType);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

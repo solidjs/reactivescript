@@ -3,6 +3,7 @@
 // is the spec rule enforced. Names resolve lexically (a component body sees its declaration
 // site, never its caller — RG-7a); provisions resolve through the static application tree (RG-7b).
 import type { Decl, Expr, Markup, Program, Stmt } from "./ast.ts";
+import { pureGlobal } from "./pure-globals.ts";
 import type { Diagnostic } from "./errors.ts";
 import type { ModuleSet } from "./modules.ts";
 import type { JsDecl, Shape } from "./parse.ts";
@@ -119,7 +120,7 @@ export function freeNames(e: Expr, bound: Set<string>, out: Set<string>): void {
     case "pre": if (!bound.has(e.name)) out.add(`pre:${e.name}`); return;
     case "peek": go(e.e); return;
     case "await": go(e.e); if (e.init) go(e.init); return;
-    case "latest": case "pending": case "un": case "spread": case "omit": go(e.e); return;
+    case "latest": case "pending": case "un": case "spread": case "omit": case "as": go(e.e); return;
     case "bin": go(e.l); go(e.r); return;
     case "if": go(e.c); go(e.t); go(e.f); return;
     case "tpl": for (const p of e.parts) if (typeof p !== "string") go(p); return;
@@ -127,7 +128,7 @@ export function freeNames(e: Expr, bound: Set<string>, out: Set<string>): void {
     case "index": go(e.o); go(e.i); return;
     case "call": go(e.f); e.args.forEach(go); return;
     case "arr": e.items.forEach(go); return;
-    case "rec": for (const f of e.fields) go("spread" in f ? f.spread : f.v); return;
+    case "rec": for (const f of e.fields) { if ("computed" in f) go(f.computed); go("spread" in f ? f.spread : f.v); } return;
     case "fn": { const b = new Set([...bound, ...e.params]); freeNames(e.body, b, out); if (e.stmts) freeNamesStmts(e.stmts, b, out); return; }
     case "draft": { go(e.seed); freeNamesStmts(e.body, new Set([...bound, "d"]), out); return; }
     case "throw": go(e.e); return;
@@ -262,6 +263,50 @@ class Checker {
     this.resolveTree();
     this.loadingOnOutside();
     this.guessWhileLoading();
+    this.styleScope(p);
+  }
+
+  /** CSS-2: a component's `<style>` scopes that view only. A class it writes that another component in the file uses, and this view does not, does not apply there. */
+  private styleScope(p: Program) {
+    const views: { name: string; css: string; line: number; classes: Set<string> }[] = [];
+    const addLit = (out: Set<string>, s: string) => { for (const c of s.split(/\s+/)) if (c) out.add(c); };
+    const classExpr = (e: Expr, out: Set<string>) => {
+      if (e.k === "lit" && typeof e.v === "string") addLit(out, e.v);
+      else if (e.k === "tpl") for (const part of e.parts) if (typeof part === "string") addLit(out, part);
+      else if (e.k === "if") { classExpr(e.t, out); classExpr(e.f, out); }
+    };
+    const elClasses = (ms: Markup[], out: Set<string>) => {
+      for (const m of ms) {
+        if (m.k === "el") { for (const a of m.attrs) if (a.name === "class") classExpr(a.e, out); elClasses(m.children, out); }
+        else if (m.k === "mif") { elClasses(m.t, out); elClasses(m.f, out); }
+        else if (m.k === "mfor") elClasses(m.body, out);
+        else if (m.k === "loading" || m.k === "errored") { elClasses(m.fallback, out); elClasses(m.body, out); }
+        else if (m.k === "portal") elClasses(m.body, out);
+      }
+    };
+    const styleClasses = (css: string) => {
+      const src = css.replace(/\/\*[\s\S]*?\*\//g, "").replace(/:global\([^)]*\)/g, "");
+      return new Set([...src.matchAll(/\.([A-Za-z_][\w-]*)/g)].map(m => m[1]));
+    };
+    const comps = (ds: Decl[]) => {
+      for (const d of ds) {
+        if (d.k === "component") {
+          const st = d.view.find(m => m.k === "style");
+          const classes = new Set<string>(); elClasses(d.view, classes);
+          views.push({ name: d.name, css: st && st.k === "style" ? st.css : "", line: st?.line ?? d.line, classes });
+        }
+        if ("decls" in d && Array.isArray(d.decls)) comps(d.decls);
+      }
+    };
+    comps(p.decls);
+    for (const v of views) {
+      if (!v.css) continue;
+      const leaked = [...styleClasses(v.css)].filter(cls => !v.classes.has(cls) && views.some(o => o !== v && o.classes.has(cls))).sort();
+      if (!leaked.length) continue;
+      const who = views.filter(o => o !== v && leaked.some(c => o.classes.has(c))).map(o => o.name);
+      this.line = v.line;
+      this.err("STYLE_SCOPE", "CSS-2", `.${leaked.join("`, `.")} in this <style> matches an element of ${who.join(", ")}, which is its own view — these styles do not apply there. Give ${who.length === 1 ? who[0] : "that component"} its own <style>, or pass a class map (CSS-5)`);
+    }
   }
 
   // ---- AC-3a: a guess a click can make while its value loads a new question ----
@@ -574,7 +619,7 @@ class Checker {
     const decls = this.opts.declarations?.get(d.declared!) ?? []; const file = d.declared!.split("/").pop();
     if (d.fails) this.err("IMPORT_ROW_MISMATCH", "MO-8", `${d.from}'s rows are declared in ${file}: \`fails\` on the import cannot restate them`);
     for (const { name, alias } of d.names) {
-      const x = decls.find(y => y.name === name);
+      const x = decls.find(y => y.kind !== "import" && y.name === name && (y.kind !== "type" || y.exported));
       if (!x) { this.err("NOT_EXPORTED", "MO-8", `${file} declares no export ${name} (declare it, or it is not ${d.from}'s)`); this.bind(env, alias, { kind: "import", name: alias, region: env.region, line: d.line, io: true }); continue; }
       if (x.kind === "type") continue;
       if (x.kind === "error") { this.bind(env, alias, { kind: "errclass", name: alias, region: env.region, line: d.line }); continue; }
@@ -655,7 +700,7 @@ class Checker {
           case "id": { const s = env.lookup(x.name); if (s?.rows) for (const r of s.rows()) rows.add(r); return; }
         }
         for (const v of Object.values(x as object)) {
-          if (Array.isArray(v)) v.forEach(y => { if (y && typeof y === "object") { if ("k" in y) walk(y as Expr); else if ("v" in y) walk((y as { v: Expr }).v); else if ("spread" in y) walk((y as { spread: Expr }).spread); } });
+          if (Array.isArray(v)) v.forEach(y => { if (y && typeof y === "object") { if ("computed" in y) walk((y as { computed: Expr }).computed); if ("k" in y) walk(y as Expr); else if ("v" in y) walk((y as { v: Expr }).v); else if ("spread" in y) walk((y as { spread: Expr }).spread); } });
           else if (v && typeof v === "object" && "k" in (v as object)) walk(v as Expr);
         }
       };
@@ -777,11 +822,14 @@ class Checker {
 
   /** E-10: a reactive argument for a value parameter of an instantiating fn is snapshotted. */
   private snapshotArgs(call: Extract<Expr, { k: "call" }>, f: Sym, env: Env) {
+    const hint = f.fnDecl?.decls.length && !f.params!.some(p => p.ref)
+      ? " If you only need a value calculation, inline the equation in an arrow fn: `fn size(xs) { n = xs.length; n }` → `fn size(xs) => xs.length`."
+      : "";
     f.params!.forEach((p, i) => {
       const a = call.args[i]; if (!a || p.ref) return;
       const reads = new Set<string>(); readsOutsidePeek(a, reads);
       const hit = [...reads].find(n => { const s = env.lookup(n); return s && reactiveKinds.has(s.kind); });
-      if (hit) this.err("SNAPSHOT_ARGUMENT", "E-10", `${f.name}(…): the argument for value parameter ${p.name} reads ${hit} and would be snapshotted — declare the parameter \`ref\`, or pass peek(…)`);
+      if (hit) this.err("SNAPSHOT_ARGUMENT", "E-10", `${f.name}(…): the argument for value parameter ${p.name} reads ${hit} and would be snapshotted — declare the parameter \`ref\`, or pass peek(…).${hint}`);
     });
   }
 
@@ -816,7 +864,8 @@ class Checker {
     if (s) { this.sided(s, ctx); return s; }
     if (BUILTINS.has(name)) return undefined;
     if (ctx.scope === "imperative" && (name === "log" || /^\$\d+$/.test(name))) return undefined;   // the apply block's parameters; `log` is io and only in imperative scope
-    this.err("UNBOUND", "SCOPE", `${name} is not declared here (a component sees its declaration site, not its caller — RG-7a)`);
+    if (pureGlobal(name)) this.err("UNBOUND", "SV-7a", `${name} is a prelude namespace: use an allowed member directly, for example \`Math.round(x)\``);
+    else this.err("UNBOUND", "SCOPE", `${name} is not declared here (a component sees its declaration site, not its caller — RG-7a); for a host global, wrap it in a JS function and import that function`);
     return undefined;
   }
   /** 12 SF-3/SF-5: what a name may be on this side. In a server body: nothing reactive (captured by kind, not position), and
@@ -852,7 +901,7 @@ class Checker {
       case "use": { if (ctx.server) this.err("SERVER_CAPTURE", "SF-3", `a server function's body reads \`use ${e.name}\`: a provision is the client's — pass it as an argument`); const c = this.ctxOf(e.name, env); if (c) this.model.read(c, ctx.scope === "imperative"); if (c && !c.ctx!.dflt) this.uses.push({ region: env.region, name: c.ctx!.key, line: this.line, display: e.name }); return; }
       case "peek": this.model.snap++; go(e.e); this.model.snap--; return;                  // E-5: a snapshot
       case "latest": case "pending": { const save = this.model.probe; this.model.probe = e.k; go(e.e); this.model.probe = save; return; }   // R-9, R-12: probes
-      case "un": case "spread": case "omit": go(e.e); return;
+      case "un": case "spread": case "omit": case "as": go(e.e); return;   // 07 §3: the assertion is erased; the read is of e
       case "await":
         if (ctx.scope === "imperative" && !this.stmtAwaits.has(e)) this.err("AWAIT_IN_EXPRESSION", "AC-1", `\`${show(e)}\` inside an expression of imperative scope: a run suspends only at a statement — bind it first, \`let v = ${show(e)}\` (a \`catch (e) => alt\` may follow it)`);
         this.awaitedCalls.add(e.e); go(e.e); if (e.init) go(e.init); return;
@@ -874,11 +923,21 @@ class Checker {
       case "bin": go(e.l); go(e.r); return;
       case "if": go(e.c); go(e.t); go(e.f); return;
       case "tpl": for (const p of e.parts) if (typeof p !== "string") go(p); return;
-      case "member": if (e.o.k === "id") this.expr(e.o, env, ctx, e.p); else go(e.o); return;
-      case "index": go(e.o); go(e.i); return;
+      case "member":
+        if (e.o.k === "id" && !env.lookup(e.o.name) && pureGlobal(e.o.name)) {
+          if (!pureGlobal(e.o.name, e.p)) this.err("UNBOUND", "SV-7a", `${e.o.name}.${e.p} is not in the pure prelude; wrap it in a JS function and import that function`);
+          return;
+        }
+        this.expr(e.o, env, ctx, field ? `${e.p}.${field}` : e.p); return;
+      case "index": {
+        const part = e.i.k === "lit" && (typeof e.i.v === "number" || typeof e.i.v === "string") ? String(e.i.v) : "*";
+        this.expr(e.o, env, ctx, field ? `${part}.${field}` : part); go(e.i); return;
+      }
       case "arr": e.items.forEach(go); return;
-      case "rec": for (const f of e.fields) go("spread" in f ? f.spread : f.v); return;
+      case "rec": for (const f of e.fields) { if ("computed" in f) go(f.computed); go("spread" in f ? f.spread : f.v); } return;
       case "call": {
+        if (e.f.k === "id" && !env.lookup(e.f.name) && pureGlobal(e.f.name, "()")) { e.args.forEach(go); return; }
+        let callee = e.f; while (callee.k === "as") callee = callee.e;
         if (e.f.k === "id" && e.f.name === "until" && !env.lookup("until")) {                  // AC-6: `until(() => p)`, a function of the language (Solid's until)
           if (ctx.scope === "reactive") this.err("IO_IN_REACTIVE", "AC-6", "until(…) waits for the world to confirm a condition: it is called from imperative scope (an action or a handler), and awaited");
           const p = e.args[0];
@@ -895,16 +954,17 @@ class Checker {
           this.expr(p, env, { scope: "imperative", server: ctx.server });                       // the callback is imperative scope
           return;
         }
-        if (e.f.k === "id") {
-          const s = env.lookup(e.f.name);
-          if (ctx.scope === "reactive" && (s?.io || (!s && e.f.name === "log"))) {
-            if (ctx.inFn) this.err("IO_IN_FN", "R-io-2", `${e.f.name}(…) is io; a fn is pure by definition`);
-            else this.err(s?.kind === "action" ? "ACTION_CALLED_IN_OWNED_SCOPE" : "IO_IN_REACTIVE", "IO-2", `${e.f.name}(…) is io and is called in reactive scope (R-io-3)${s?.ioVia ? ` — its server body calls ${s.ioVia}` : ""}`);
+        if (callee.k === "id") {
+          const name = callee.name;
+          const s = env.lookup(name);
+          if (ctx.scope === "reactive" && (s?.io || (!s && name === "log"))) {
+            if (ctx.inFn) this.err("IO_IN_FN", "R-io-2", `${name}(…) is io; a fn is pure by definition`);
+            else this.err(s?.kind === "action" ? "ACTION_CALLED_IN_OWNED_SCOPE" : "IO_IN_REACTIVE", "IO-2", `${name}(…) is io and is called in reactive scope (R-io-3)${s?.ioVia ? ` — its server body calls ${s.ioVia}` : ""}`);
           }
-          if (s?.side === "client" && ctx.scope === "reactive" && !ctx.server && !this.awaitedCalls.has(e)) this.err("CLIENT_NOT_AWAITED", "SF-5b", `${e.f.name}(…) is \`client\` JS: in reactive scope it is awaited — a client question, asked once the browser has the page (SV-7b) — never called for its value now`);
-          if (s?.kind === "fn" && s.instantiating) this.err("INSTANTIATION_NOT_BOUND", "E-9", `${e.f.name}(…) declares state: bind it, \`x = ${e.f.name}(…)\` (RG-6)`);
-          if (s?.kind === "comp") this.err("COMPONENT_AS_VALUE", "RG-4a", `component ${e.f.name} called as a function: apply it in a view`);
-          if (s?.kind === "action" && s.arity !== undefined && e.args.length !== s.arity) this.err("ARGUMENT_COUNT", "AC-1f", `${e.f.name} takes ${s.arity === 0 ? "no arguments" : s.arity === 1 ? "1 argument" : `${s.arity} arguments`} and is called with ${e.args.length}: an action's parameters are its whole input — pass each one, and nothing it does not declare`);
+          if (s?.side === "client" && ctx.scope === "reactive" && !ctx.server && !this.awaitedCalls.has(e)) this.err("CLIENT_NOT_AWAITED", "SF-5b", `${name}(…) is \`client\` JS: in reactive scope it is awaited — a client question, asked once the browser has the page (SV-7b) — never called for its value now`);
+          if (s?.kind === "fn" && s.instantiating) this.err("INSTANTIATION_NOT_BOUND", "E-9", `${name}(…) declares state: bind it, \`x = ${name}(…)\` (RG-6)`);
+          if (s?.kind === "comp") this.err("COMPONENT_AS_VALUE", "RG-4a", `component ${name} called as a function: apply it in a view`);
+          if (s?.kind === "action" && s.arity !== undefined && e.args.length !== s.arity) this.err("ARGUMENT_COUNT", "AC-1f", `${name} takes ${s.arity === 0 ? "no arguments" : s.arity === 1 ? "1 argument" : `${s.arity} arguments`} and is called with ${e.args.length}: an action's parameters are its whole input — pass each one, and nothing it does not declare`);
           this.model.call(s);
         }
         go(e.f); e.args.forEach(go); return;
@@ -939,8 +999,8 @@ class Checker {
   /** AC-1c, AC-1d, AC-1e over one imperative run (ref/src/infer.ts). */
   private runChecks(stmts: Stmt[], action: boolean, bound: string[], inferred = false, opts: RunOpts = {}) {
     for (const f of runFindings(stmts, action, bound, inferred, opts)) {
-      if (f.code === "STALE_CAPTURE") { this.err("STALE_CAPTURE", "AC-1g", `${f.name} := … after an \`await\` writes ${f.via}, which is not the server's: ${f.name} is the server's answer, and after the \`await\` it takes only what the server answered, plain arguments (an id, a title, an index) and its own value at the write (\`${f.name} := rs => …\`, finding rows there by id). A row passed in, or read from a source before the \`await\` or after it, is what the screen showed, and may be stale by now (a rename accepted, a reload, an earlier write declined, a write another action holds) — when the answer alone doesn't say where a row is now, re-ask the answers it left and joined (\`refresh\`)`); continue; }
-      if (f.code === "HELD_WRITE") this.err("HELD_WRITE", "AC-1c", `${f.name} := … comes before an \`await\` in a body that is an action because it writes and awaits (AC-1b), so it is held until the body ends (AC-1): for state that shows while the work runs, \`guess ${f.name} := …\` (a source with a question, ST-5c); for a reset that lands now, \`onFlush(() => { ${f.name} := … })\` (EF-8); to hold it on purpose, declare the action (\`action name() { … }\`); or write it after the \`await\``);
+      if (f.code === "STALE_CAPTURE") { this.err("STALE_CAPTURE", "AC-1g", `${f.name} := … after an \`await\` writes ${f.via}, which is not the server's: use the server's answer, plain arguments, or the current value in \`${f.name} := rs => …\`. If you need a row's id, call \`save(row.id)\` in the handler and declare \`action save(id: string)\`, using the actual id type; \`let id = row.id\` inside the action still reads the displayed row. Find the current row by id in the updater, or \`refresh\` if the server's answer doesn't say where it is now`); continue; }
+      if (f.code === "HELD_WRITE") this.err("HELD_WRITE", "AC-1c", `${f.name} := … comes before an \`await\` in a body that is an action because it writes and awaits (AC-1b), so it is held until the body ends (AC-1): for state that shows while the work runs, \`guess ${f.name} := …\` (AC-3); for a reset that lands now, \`onFlush(() => { ${f.name} := … })\` (EF-8); to hold it on purpose, declare the action (\`action name() { … }\`); or write it after the \`await\``);
       else if (f.code === "STALE_WRITE_BACK") this.err("STALE_WRITE_BACK", "AC-1e", `${f.name} := … after an \`await\` is computed from ${f.name} as it was read before that \`await\`: whatever changed ${f.name} in between (another action, a reload) is overwritten — write functionally (\`${f.name} := v => …\`, W-6), which applies to ${f.name} as it stands at the write, or guess it (\`guess\`, AC-3) and let the answer replace the guess`);
       else this.err("STALE_OWN_READ", "AC-1d", `${f.name} is read after this change wrote it: the read sees the committed value, not the write (W-4) — keep the value you wrote in a local (\`let v = …; ${f.name} := v\`) and read that, or write functionally (\`${f.name} := v => …\`, W-6)`);
     }
@@ -1041,7 +1101,7 @@ class Checker {
         return;
       }
       for (const v of Object.values(x as object)) {
-        if (Array.isArray(v)) v.forEach(y => { if (y && typeof y === "object") { if ("k" in y) walk(y as Expr, res); else if ("v" in y) walk((y as { v: Expr }).v, res); else if ("spread" in y) walk((y as { spread: Expr }).spread, res); } });
+        if (Array.isArray(v)) v.forEach(y => { if (y && typeof y === "object") { if ("computed" in y) walk((y as { computed: Expr }).computed, res); if ("k" in y) walk(y as Expr, res); else if ("v" in y) walk((y as { v: Expr }).v, res); else if ("spread" in y) walk((y as { spread: Expr }).spread, res); } });
         else if (v && typeof v === "object" && "k" in (v as object)) walk(v as Expr, res);
       }
     };
@@ -1167,10 +1227,44 @@ class Checker {
           if (m.classes) for (const n of m.classes) this.errClass(n, env);
           const body = this.region(env.region, "errored"); body.catches = catchOf(m.classes);                 // R-f-4: the boundary discharges its classes for its content
           this.block(m.decls, m.body, new Env(env, body), { scope: "reactive" });
+          if (m.classes?.length) this.deadTyped(m);
           break;
         }
       }
     }
+  }
+
+  /** R-f-4: a typed `errored (e: X)` whose view is wrapped by an inner catch-all. The catch-all takes X first, so the typed fallback is dead. */
+  private deadTyped(m: Extract<Markup, { k: "errored" }>) {
+    const inner = this.coveringCatchAll(m.body);
+    if (!inner) return;
+    const line = m.line ?? this.line;
+    const cls = m.classes!.join(" | ");
+    this.line = line;
+    this.err("DEAD_TYPED_BOUNDARY", "R-f-4", `errored fallback(e: ${cls}) at line ${line} is dead: the inner catch-all at line ${inner.line ?? line} catches ${cls} first — put the typed boundary inside the catch-all`);
+  }
+  /** The catch-all that wraps every child, if the view is only that (a plain element around it still counts). A reader, a component, or a condition outside one means the typed boundary can still see a failure. */
+  private coveringCatchAll(ms: Markup[]): Extract<Markup, { k: "errored" }> | null {
+    let inner: Extract<Markup, { k: "errored" }> | null = null;
+    let saw = false;
+    for (const m of ms) {
+      if (m.k === "text" || m.k === "style") continue;
+      saw = true;
+      if (m.k === "errored" && !m.classes && this.staticFallback(m.fallback)) { inner = inner ?? m; continue; }
+      if (m.k === "el" && !/^[A-Z]/.test(m.tag) && m.attrs.every(a => a.e.k === "lit")) {
+        const c = this.coveringCatchAll(m.children);
+        if (!c) return null;
+        inner = inner ?? c;
+        continue;
+      }
+      return null;
+    }
+    return saw ? inner : null;
+  }
+  /** A fallback runs outside its own catch. Prove it inert without guessing about readers or foreign code. */
+  private staticFallback(ms: Markup[]): boolean {
+    return ms.every(m => m.k === "text" || m.k === "style" || m.k === "read" && m.e.k === "lit"
+      || m.k === "el" && /^[a-z][a-z0-9]*$/.test(m.tag) && m.attrs.every(a => a.e.k === "lit") && this.staticFallback(m.children));
   }
 
   // ---- SV-7d: the content model across templates ----
@@ -1289,7 +1383,7 @@ class Checker {
       case "draft": { go(e.seed); for (const st of e.body) { if (st.k === "let" || st.k === "expr" || st.k === "write") go(st.e); } return out; }
       default: {
         for (const v of Object.values(e as object)) {
-          if (Array.isArray(v)) v.forEach(y => { if (typeof y === "string") return; if (y && typeof y === "object") { if ("k" in y) go(y as Expr); else if ("v" in y) go((y as { v: Expr }).v); else if ("spread" in y) go((y as { spread: Expr }).spread); } });
+          if (Array.isArray(v)) v.forEach(y => { if (typeof y === "string") return; if (y && typeof y === "object") { if ("computed" in y) go((y as { computed: Expr }).computed); if ("k" in y) go(y as Expr); else if ("v" in y) go((y as { v: Expr }).v); else if ("spread" in y) go((y as { spread: Expr }).spread); } });
           else if (v && typeof v === "object" && "k" in (v as object)) go(v as Expr);
         }
         return out;
@@ -1298,9 +1392,10 @@ class Checker {
   }
   /** R-f-8: what an awaited value's promise may reject with. A call into a JS import: its declared failure (Error unless narrowed). */
   private rejects(e: Expr, env: Env, seen: Set<Sym>): Set<string> {
-    const root = (x: Expr): Expr => x.k === "member" || x.k === "index" ? root(x.o) : x;
+    const root = (x: Expr): Expr => x.k === "member" || x.k === "index" ? root(x.o) : x.k === "as" ? root(x.e) : x;
     switch (e.k) {
       case "lit": case "tpl": case "arr": case "rec": case "bin": case "un": return new Set();   // values: `await` is the value (R-1)
+      case "as": return this.rejects(e.e, env, seen);
       case "if": return new Set([...this.rejects(e.t, env, seen), ...this.rejects(e.f, env, seen)]);
       case "call": {
         const r = root(e.f);
@@ -1424,7 +1519,7 @@ class Checker {
         for (const it of e.reqs) if (routes(a.site).some(q => escP(q, it.name))) pushR({ ...it, line: it.line < 0 ? a.line : it.line, what: `${it.what} (in <${a.tag}>)` });
       }
       for (const a of argF) if (compOf(a.app.site) === C) for (const cls of a.f.cls) for (const p of PF(a.app.comp, a.field)) {
-        if (p.term) { if (escF(p.chain, cls)) { this.line = a.app.line; this.err("UNCAUGHT_ACTION_FAILURE", "R-f-6", `action ${p.term.name} in <${a.app.tag}> reads props.${a.field}, which can fail with ${cls} here (line ${a.app.line}), and does not catch it`); } continue; }
+        if (p.term) { if (escF(p.chain, cls)) { this.line = a.app.line; this.err("UNCAUGHT_ACTION_FAILURE", "R-f-6", `action ${p.term.name} in <${a.app.tag}> reads props.${a.field}, which can fail with ${cls} here (line ${a.app.line}). A surrounding errored region catches render reads, not action snapshots — catch the read in the action, or pass a plain value from the handler`); } continue; }
         if (routes(a.app.site).some(q => escF([...p.chain, ...q], cls))) { pushF({ cls, line: a.app.line, what: `<${a.app.tag} ${a.field === "*" ? "{...…}" : `${a.field}={…}`}>` }); break; }
       }
       const res = { fails, reqs }; escBusy.delete(C); escMemo.set(C, res); return res;

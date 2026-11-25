@@ -5,6 +5,7 @@
 import { primsSolid } from "./prims-solid.ts";
 import { Portal as WebPortal } from "@solidjs/web";
 import { getObserver } from "solid-js";
+import { actionInput } from "./action-input.ts";
 import {
   createSignal, createMemo, createEffect, createOptimistic, createOptimisticStore, createStore, createProjection, createDeferred, createErrorBoundary, createContext,
   Show, For, Loading, Errored, createComponent,
@@ -108,7 +109,7 @@ export class Flight {
 }
 
 // ---------------------------------------------------------------- one app instance
-export function createApp(opts: { root: any; api?: Record<string, (...a: any[]) => unknown> }) {
+export function createApp(opts: { root: any; api?: Record<string, (...a: any[]) => unknown>; scenarioFlights?: boolean }) {
   const flights = new Map<string, Flight>();
   const lastKey = new Map<string, string>();
   const truthOf = new Map<Acc, Acc>();                                  // an optimistic signal-form source: its guess layer -> its question
@@ -149,10 +150,15 @@ export function createApp(opts: { root: any; api?: Record<string, (...a: any[]) 
       fetch: (key: string) => opts.api?.fetch ? opts.api.fetch(key) : flight(String(key)),
       log: (...a: unknown[]) => { log.push(`log(${a.map(fmt).join(", ")})`); },
     } as Record<string, any>,
-    /** `import pure { f } from "./api"`: every function is a flight keyed by its name and formatted arguments. */
     /** MO-8: a class `api.d.rx` declares as an error: the real module's, or (in the harness) a stand-in `C(message)`. */
     jsError: (name: string) => jsErrors.get(name) ?? (jsErrors.set(name, (opts.api?.[name] as unknown) ?? errorClass(name, ["message"], (m?: unknown) => m ?? name, `${name}#${classSeq++}`)), jsErrors.get(name)),
-    api: (name: string) => opts.api ? (opts.api[name] ?? (() => { throw new Error(`./api has no ${name}`); })) : (...a: unknown[]) => flight(`${name}:${a.map(fmt).join(",")}`),
+    api: (name: string) => {
+      if (!opts.api) {
+        if (opts.scenarioFlights) return (...a: unknown[]) => flight(`${name}:${a.map(fmt).join(",")}`);
+        throw new Error(`MISSING_TEST_API: cannot bind ${name} from "./api"; pass createApp({ api }) or provide a local JS module`);
+      }
+      return opts.api[name] ?? (() => { throw new Error(`./api has no ${name}`); });
+    },
     /** MO-10: the scenario prelude's `./prims` — Solid primitives, as a library writes them (`ref/compile/prims-solid.ts`). */
     prim: (name: string) => primsSolid({ createSignal: createSignal as any, createMemo: createMemo as any })[name] ?? (() => { throw new Error(`./prims has no ${name}`); }),
 
@@ -245,7 +251,7 @@ export function createApp(opts: { root: any; api?: Record<string, (...a: any[]) 
     /** `action f(…) { … }` (AC-1): a generator; a statement-level `await` is a hold-safe yield. */
     action(gen: (...a: unknown[]) => Generator<unknown, unknown, unknown>) {
       const run = action(gen as any) as (...a: unknown[]) => Promise<unknown>;
-      return (...a: unknown[]) => { const p = run(...a); p.catch(e => { app.asyncError = e; }); return p; };
+      return (...a: unknown[]) => { const p = run(...untrack(() => actionInput(a, $TARGET))); p.catch(e => { app.asyncError = e; }); return p; };
     },
     awaited: (v: unknown) => v instanceof Flight ? v.first : v,
     /** `x = await f() catch (e: C) => alt` (R-f-4): a matching rejection lands `alt` as the answer; others reject on. */

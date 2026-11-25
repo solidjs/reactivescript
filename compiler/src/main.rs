@@ -28,10 +28,10 @@
 
 use reactivescript::app::{self, read_disk};
 use reactivescript::check::check_modules;
-use reactivescript::emit::{compile_modules, lower_view, Target};
+use reactivescript::emit::{compile_linked, compile_into, lower_view, Target};
 use reactivescript::parse::parse_stmts;
 use reactivescript::project::{project_modules, unverified, PRELUDE};
-use reactivescript::modules::load_modules;
+use reactivescript::modules::{load_modules, load_modules_recovering};
 use reactivescript::serve;
 use reactivescript::signature::print_signature;
 use serde_json::{json, Map, Value};
@@ -121,7 +121,7 @@ fn lower_one(r: &Value) -> Value {
     }
     // a handler row that does not parse runs nothing (ref/compile/run.ts)
     let extra: Vec<_> = r["extra"].as_array().map(|xs| xs.iter().map(|x| parse_stmts(x.as_str().unwrap()).unwrap_or_default()).collect()).unwrap_or_default();
-    let out = match compile_modules(&set, &extra) {
+    let out = match compile_linked(&set, &extra, r["product"].as_bool().unwrap_or(false)) {
         Ok(o) => o,
         Err(e) => return json!({ "compileError": e.0 }),
     };
@@ -286,7 +286,7 @@ fn main() {
             if !checked.diags.is_empty() {
                 std::process::exit(1);
             }
-            let out = compile_modules(&set, &[]).unwrap_or_else(|e| {
+            let out = compile_into(&set, &[], false, Some(&abs(&dir))).unwrap_or_else(|e| {
                 eprintln!("{}: not compiled: {}", file, e.0);
                 std::process::exit(1);
             });
@@ -322,7 +322,9 @@ fn main() {
             let as_json = cmd == "check" && args.iter().any(|a| a == "--json");
             let mut found: Vec<Value> = vec![];
             for f in args[1..].iter().filter(|a| !a.starts_with("--")) {
-                let set = match load_modules(&abs(f), &read_disk) {
+                let entry = abs(f);
+                let loaded = if cmd == "check" { load_modules_recovering(&entry, &read_disk) } else { load_modules(&entry, &read_disk) };
+                let set = match loaded {
                     Ok(s) => s,
                     Err(e) => {
                         bad += 1;
@@ -334,8 +336,19 @@ fn main() {
                         continue;
                     }
                 };
+                for e in &set.parse_errors {
+                    bad += 1;
+                    if as_json {
+                        found.push(parse_error_json(f, e));
+                    } else {
+                        eprintln!("{}", parse_error_text(f, e));
+                    }
+                }
                 let checked = check_modules(&set, spa);
                 for d in &checked.diags {
+                    // As in `rx-tsc`, a file with parse errors gets its parse diagnostics,
+                    // not checker diagnostics from its partial tree. Still check other files.
+                    if set.parse_errors.iter().any(|e| e.2 == d.file) { continue; }
                     bad += 1;
                     if as_json {
                         found.push(serve::diagnostic_json(&set, d));
@@ -355,7 +368,7 @@ fn main() {
                         })
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&ms).unwrap());
-                } else if checked.diags.is_empty() && !as_json {
+                } else if checked.diags.is_empty() && set.parse_errors.is_empty() && !as_json {
                     println!("{}: ok", f);
                 }
             }

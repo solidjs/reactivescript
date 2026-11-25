@@ -23,16 +23,16 @@ const lowerMode = process.argv.includes("--lower");
 const projectMode = process.argv.includes("--project");
 const filter = process.argv.slice(2).find(a => !a.startsWith("--"));
 const verbose = !!process.env.VERBOSE;
-type Req = { id: string; entry: string; files: Record<string, string>; extra?: string[] };
+type Req = { id: string; entry: string; files: Record<string, string>; extra?: string[]; product?: boolean };
 const reqs: Req[] = [];
 
 /** A program: its entry and every file the loader reads for it (MO-8 `.d.rx`, MO-9 signatures, imported modules). */
-function add(id: string, entry: string, read: (p: string) => string | undefined, extra?: string[]) {
+function add(id: string, entry: string, read: (p: string) => string | undefined, extra?: string[], product?: boolean) {
   if (filter && !id.includes(filter)) return;
   const files: Record<string, string> = {};
   const rec = (p: string) => { const s = read(p); if (s !== undefined) files[p] = s; return s; };
   try { loadModules(entry, rec); } catch { /* the files read up to the error are what both sides see */ }
-  reqs.push({ id, entry, files, ...(extra ? { extra } : {}) });
+  reqs.push({ id, entry, files, ...(extra ? { extra } : {}), ...(product ? { product } : {}) });
 }
 const disk = (p: string) => existsSync(p) && statSync(p).isFile() ? readFileSync(p, "utf8") : undefined;
 
@@ -56,6 +56,33 @@ for (const f of readdirSync(sdir).filter(f => f.endsWith(".md") && f !== "TEMPLA
 }
 const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap(e => e.isDirectory() ? walk(join(d, e.name)) : e.name.endsWith(".rx") && !e.name.endsWith(".d.rx") ? [join(d, e.name)] : []);
 for (const f of walk(join(root, "examples")).sort()) add(`examples/${f.slice(join(root, "examples").length + 1)}`, f, disk, lowerMode ? [] : undefined);
+
+// MO-8c/d: a real, importer-relative API in a mixed value/type import. Exercise
+// this in the lowering comparison rather than the flight-based scenario runners.
+if (lowerMode) {
+  const files = new Map([
+    ["src/main.rx", `import pure { load, Book as Volume } from "./api"
+import { Title } from "./types"
+export default component App() {
+  book: Volume = load()
+  title: Title = book.title
+  <p>{title}</p>
+}
+`],
+    ["src/api.ts", `export type Book = { title: string };\nexport const load = (): Book => ({ title: "A" });\n`],
+    ["src/api.d.rx", `export pure fn load(): Book\nexport type Book = { title: string }\n`],
+    ["src/types.ts", `export type Title = string;\n`],
+    ["src/types.d.rx", `export type Title = string\n`],
+  ]);
+  add("MO-8 real API and type imports", "src/main.rx", path => files.get(path), []);
+  const product = new Map([
+    ["src/main.rx", `import { caption } from "./caption.rx"
+export default component App() { <p>{caption}</p> }`],
+    ["src/caption.rx", `import pure { label } from "./virtual.js"
+export caption = label()`],
+  ]);
+  add("MO-8 product bundler resolves a relative import", "src/main.rx", path => product.get(path), [], true);
+}
 
 const plain = (x: unknown) => JSON.parse(JSON.stringify(x, (_k, v) => v instanceof Map ? Object.fromEntries(v) : v instanceof Set ? [...v] : v));
 function refOf(r: Req) {
@@ -88,7 +115,11 @@ const got = new Map((JSON.parse(out) as any[]).map(x => [x.id, x]));
 let bad = 0;
 for (const r of reqs) {
   const want = refOf(r); const { id: _, spans, ...have } = got.get(r.id) ?? {};
-  const d = diff(want, have) ?? (spans && Object.keys(spans).length ? `spans (CP-8): ${JSON.stringify(spans).slice(0, 400)}` : null);
+  const outline = (value: typeof have) => Object.values(value.models ?? {}).map((m: any) => m.regions.map((r: any) => r.outline));
+  const d = diff(want, have)
+    ?? (JSON.stringify(outline(want)) !== JSON.stringify(outline(have)) ? "outline JSON differs byte-for-byte" : null)
+    ?? (r.id === "view outline cap" && !outline(have)[0]?.some((o: any[]) => o.length === 401 && o.at(-1)?.text === "…") ? "outline cap must keep 400 parts and an ellipsis" : null)
+    ?? (spans && Object.keys(spans).length ? `spans (CP-8): ${JSON.stringify(spans).slice(0, 400)}` : null);
   if (d) { bad++; console.log(`FAIL ${r.id}\n  ${d}`); } else if (verbose) console.log(`ok   ${r.id}`);
 }
 console.log(`${reqs.length - bad}/${reqs.length} programs: the crate agrees with ref/ (AST, diagnostics, signatures, resolved model), and its spans hold (CP-8)`);
@@ -113,7 +144,7 @@ async function lower(): Promise<number> {
       if (checkModules(set).diags.length) want = { refused: true };
       else {
         const extra = (r.extra ?? []).map(s => { try { return parseStmts(s); } catch { return []; } });
-        let c; try { c = compileModules(set, { extraStmts: extra }); } catch (e) { if (!(e instanceof CompileError)) throw e; c = null; want = { compileError: (e as Error).message }; }
+        let c; try { c = compileModules(set, { extraStmts: extra, bySource: r.product }); } catch (e) { if (!(e instanceof CompileError)) throw e; c = null; want = { compileError: (e as Error).message }; }
         if (c) {
           const files: Record<string, Record<string, string>> = {};
           for (const [k, target] of [["universal", "universal"], ["dom", "dom"], ["ssr", "ssr"]] as const) {
