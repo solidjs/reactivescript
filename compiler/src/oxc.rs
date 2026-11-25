@@ -328,11 +328,13 @@ impl<'a> Build<'a> {
                 SPAN,
                 self.vec(props.iter().map(|p| match p {
                     Prop::Kv(k, v) => {
+                        let computed = matches!(k, Key::Computed(_));
                         let key = match k {
                             Key::Ident(n) => PropertyKey::new_static_identifier(SPAN, self.s(n), b),
                             Key::Str(s) => PropertyKey::new_string_literal(SPAN, self.s(s), None, b),
+                            Key::Computed(x) => PropertyKey::from(self.expr(x)),
                         };
-                        ObjectPropertyKind::new_object_property(SPAN, PropertyKind::Init, key, self.expr(v), false, false, false, b)
+                        ObjectPropertyKind::new_object_property(SPAN, PropertyKind::Init, key, self.expr(v), false, false, computed, b)
                     }
                     Prop::Spread(x) => ObjectPropertyKind::new_spread_property(SPAN, self.expr(x), b),
                 })),
@@ -378,7 +380,6 @@ impl<'a> Build<'a> {
     fn children(&self, cs: &[Child]) -> ArenaVec<'a, JSXChild<'a>> {
         self.vec(cs.iter().map(|c| match c {
             Child::Expr(e) => JSXChild::new_expression_container(SPAN, JSXExpression::from(self.expr(e)), &self.b),
-            Child::Text(t) => JSXChild::new_text(SPAN, self.s(t), Some(self.s(t).into()), &self.b),
             Child::Jsx(Jsx::Frag(cs, line)) => self.on_line(*line, || {
                 let start = self.open();
                 let cs = self.children(cs);

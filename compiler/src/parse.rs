@@ -206,7 +206,7 @@ fn parse_type(c: &mut Cursor, brace_stops: bool, arrows: bool) -> R<String> {
             continue;
         }
         let ch = c.peek();
-        if depth == 0 && (c.starts_with("//") || c.starts_with("=>") || c.starts_with(":=") || ch == '=' || ch == ',' || ch == ')' || ch == ';' || ch == '\n' || (brace_stops && ch == '{')) {
+        if depth == 0 && (c.starts_with("//") || c.starts_with("=>") || c.starts_with(":=") || ch == '=' || ch == ',' || ch == ')' || ch == '}' || ch == ';' || ch == '\n' || (brace_stops && ch == '{')) {
             break;
         }
         if "([{<".contains(ch) {
@@ -245,12 +245,15 @@ fn opt_type(c: &mut Cursor, brace_stops: bool) -> R<Option<String>> {
 }
 /// R-f: `A | B` — error class names. `Error` (or TS's `unknown`/`any`) is every failure: `None`.
 fn parse_classes(c: &mut Cursor) -> R<Option<Vec<String>>> {
+    parse_class_list(c, false)
+}
+fn parse_class_list(c: &mut Cursor, commas: bool) -> R<Option<Vec<String>>> {
     let mut out = vec![];
     loop {
         c.ws(true);
         out.push(c.ident_or("error class")?);
         c.ws(false);
-        if c.peek() == '|' && c.peek_at(1) != '|' {
+        if (c.peek() == '|' && c.peek_at(1) != '|') || (commas && c.peek() == ',') {
             c.bump();
             continue;
         }
@@ -266,6 +269,7 @@ re!(JS_APIS, r"\b(useState|useReducer|useMemo|useCallback|useEffect|useRef|creat
 re!(JS_FUNCTION, r"^(export\s+)?(default\s+)?(async\s+)?function\b");
 re!(JS_LOCAL, r"^(const|let|var)\b");
 re!(JS_RETURN, r"^return\b");
+re!(FOR_NAME, r"\bfor\s+[A-Za-z_$]");
 re!(NAME_BEFORE, r"([A-Za-z_$][A-Za-z0-9_$.]*)\s*$");
 re!(ARROW_BEFORE, r"=>\s*[A-Za-z_$][A-Za-z0-9_$.]*\s*$");
 re!(OP_ASSIGN, r"^(\+\+|--|(\*\*|\|\||&&|\?\?|[-+*/%])=)");
@@ -273,6 +277,9 @@ re!(OP_ASSIGN, r"^(\+\+|--|(\*\*|\|\||&&|\?\?|[-+*/%])=)");
 /// What a parse failure at `i` most likely meant, when the line reads like JavaScript, React or Solid: its code and the
 /// text appended to the message. `ref/src/parse.ts` `hint` is the same function.
 pub fn hint(src: &str, i: usize, msg: &str) -> Option<(&'static str, String)> {
+    if msg == "action parameter default" {
+        return Some(("ACTION_PARAMETER_DEFAULT", "an action takes one argument per parameter (AC-1f); remove the default and pass the value at the call".into()));
+    }
     let i = i.min(src.len());
     let rest = &src[i..];
     let at = if !rest.is_empty() && !rest.split('\n').next().unwrap_or("").trim().is_empty() { i as i64 } else { src[..i].trim_end().len() as i64 - 1 };
@@ -299,6 +306,12 @@ pub fn hint(src: &str, i: usize, msg: &str) -> Option<(&'static str, String)> {
     }
     if let Some(c) = JS_APIS.captures(line) {
         return Some(("JS_API", format!("`{}` is not .rx: state is `source x := …`, a value computed from others is `x = …`, a side effect is `effect (x) {{ … }}`", &c[1])));
+    }
+    if msg == "expression" && rest.starts_with('<') && before.contains('?') {
+        return Some(("JSX_TERNARY", "markup is not an expression: write `{if c { <span/> } else { \"\" }}`, not `c ? <span/> : \"\"`".into()));
+    }
+    if msg == "in" && rest.trim_start().starts_with(',') && FOR_NAME.is_match(line) {
+        return Some(("FOR_INDEX", "`for` binds one name: `for x in xs { … }`. The index is `xs.indexOf(x)` in the body, or map the list first: `rows = map(xs, (x, i) => ({ x, i }))`".into()));
     }
     None
 }
@@ -481,35 +494,126 @@ fn shape_of(t: &str) -> Shape {
 pub enum JsDecl {
     /// ret: the type text with `ref` taken out (for TY); MO-10: refs (ref parameters), shape (what the result is),
     /// instantiates (written, or inferred from a ref on either side)
-    Fn { name: String, pure: bool, params: Vec<String>, rejects: Option<Vec<String>>, line: usize, side: Option<Side>, ptypes: Vec<Option<String>>, ret: Option<String>, refs: Vec<bool>, shape: Shape, instantiates: bool },
+    Fn { name: String, pure: bool, params: Vec<String>, generics: Option<String>, rejects: Option<Vec<String>>, line: usize, side: Option<Side>, ptypes: Vec<Option<String>>, ret: Option<String>, refs: Vec<bool>, shape: Shape, instantiates: bool },
     Error { name: String, line: usize },
-    Type { name: String, line: usize, text: String },
+    Type { name: String, line: usize, text: String, exported: bool },
+    /// MO-8e: types only. `target` / `rx` are filled by the loader, not the parser.
+    Import { names: Vec<ImportName>, from: String, line: usize, target: Option<String>, rx: bool },
 }
 impl JsDecl {
+    pub fn exported(&self) -> bool {
+        match self {
+            Self::Type { exported, .. } => *exported,
+            Self::Import { .. } => false,
+            _ => true,
+        }
+    }
     pub fn name(&self) -> &str {
         match self {
             JsDecl::Fn { name, .. } | JsDecl::Error { name, .. } | JsDecl::Type { name, .. } => name,
+            JsDecl::Import { .. } => "",
         }
     }
+}
+const DECL_IMPORT: &str = "a declaration file imports types only: `import { T, U as V } from \"./x\"`";
+/// MO-8e: `import { T, U as V } from "./x"` in a `.d.rx` — types only, resolved by the loader.
+fn parse_decl_import(c: &mut Cursor, line: usize) -> R<JsDecl> {
+    c.keyword("import");
+    c.ws(true);
+    if c.keyword("type") {
+        c.ws(true);
+    }
+    if c.keyword("pure") || c.keyword("server") || c.keyword("client") || !c.starts_with("{") {
+        return c.fail(DECL_IMPORT);
+    }
+    c.expect("{")?;
+    c.ws(true);
+    let mut names = vec![];
+    while !c.starts_with("}") {
+        let name = c.ident_or("import name")?;
+        c.ws(true);
+        let mut alias = name.clone();
+        if c.keyword("as") {
+            c.ws(true);
+            alias = c.ident_or("alias")?;
+            c.ws(true);
+        }
+        names.push(ImportName { name, alias });
+        if !c.eat(",") {
+            break;
+        }
+        c.ws(true);
+    }
+    if names.is_empty() {
+        return c.fail("import name");
+    }
+    c.expect("}")?;
+    c.ws(true);
+    if !c.keyword("from") {
+        return c.fail("from");
+    }
+    c.ws(true);
+    let from = match parse_primary(c)?.k {
+        ExprKind::Lit(Lit::Str(s)) => s,
+        _ => return c.fail("module path"),
+    };
+    let save = c.i;
+    c.ws(false);
+    if c.keyword("fails") {
+        return c.fail(DECL_IMPORT);
+    }
+    c.i = save;
+    Ok(JsDecl::Import { names, from, line, target: None, rx: false })
+}
+fn type_params(c: &mut Cursor) -> R<Option<String>> {
+    let start = c.i;
+    if !c.eat("<") { return Ok(None); }
+    let mut depth = 1;
+    while !c.eof() {
+        if c.eat("=>") { continue; }
+        if c.eat("<") { depth += 1; }
+        else if c.eat(">") {
+            depth -= 1;
+            if depth == 0 { return Ok(Some(c.src[start..c.i].to_string())); }
+        } else if matches!(c.peek(), '\'' | '"' | '`') {
+            let quote = c.peek();
+            c.bump();
+            while !c.eof() && c.peek() != quote {
+                c.eat("\\");
+                c.bump();
+            }
+            if c.eof() { return c.fail("unterminated string in type parameters"); }
+            c.bump();
+        } else { c.bump(); }
+    }
+    c.fail("expected '>' to end type parameters")
 }
 pub fn parse_declarations(src: &str) -> R<Vec<JsDecl>> {
     let mut c = Cursor::new(src);
     let mut out = vec![];
     loop {
         c.ws(true);
+        if c.eat(";") { continue; }
         if c.eof() {
             return Ok(out);
         }
         let line = c.line();
-        if !c.keyword("export") {
-            return c.fail("a declaration file declares exports: `export pure fn …`, `export fn …`, `export error …`, `export type …`");
-        }
+        let exported = c.keyword("export");
         c.ws(true);
-        if c.starts_with("type") || c.starts_with("interface") {
+        if !exported && c.peek_ident().as_deref() == Some("import") {
+            out.push(parse_decl_import(&mut c, line)?);
+            continue;
+        }
+        if exported && c.peek_ident().as_deref() == Some("import") {
+            return c.fail("a declaration file imports types for its signatures; it does not re-export (`import { T } from \"./x\"`)");
+        }
+        if matches!(c.peek_ident().as_deref(), Some("type" | "interface")) {
             let t0 = c.i;
             let _ = c.keyword("type") || c.keyword("interface");
             c.ws(true);
             let name = c.ident_or("type name")?;
+            c.ws(true);
+            type_params(&mut c)?;
             c.ws(true);
             if c.eat("=") {
                 c.ws(true);
@@ -529,8 +633,11 @@ pub fn parse_declarations(src: &str) -> R<Vec<JsDecl>> {
                     }
                 }
             }
-            out.push(JsDecl::Type { name, line, text: c.src[t0..c.i].to_string() });
+            out.push(JsDecl::Type { name, line, text: c.src[t0..c.i].to_string(), exported });
             continue;
+        }
+        if !exported {
+            return c.fail("a declaration file declares exports: `export pure fn …`, `export fn …`, `export error …`, `export type …`, or `import { T } from \"./x\"`");
         }
         if c.keyword("error") {
             c.ws(true);
@@ -548,11 +655,16 @@ pub fn parse_declarations(src: &str) -> R<Vec<JsDecl>> {
         c.ws(true);
         let pure = c.keyword("pure");
         c.ws(true);
+        if c.keyword("const") {
+            return c.fail("a .d.rx cannot declare a const export; expose a stable value through `export pure fn getValue(): T`");
+        }
         if !c.keyword("fn") {
             return c.fail("fn");
         }
         c.ws(true);
         let name = c.ident_or("fn name")?;
+        c.ws(true);
+        let generics = type_params(&mut c)?;
         c.ws(true);
         c.expect("(")?;
         c.ws(true);
@@ -565,8 +677,16 @@ pub fn parse_declarations(src: &str) -> R<Vec<JsDecl>> {
                 c.ws(true);
             }
             refs.push(r);
-            params.push(c.ident_or("param")?);
+            let mut p = c.ident_or("param")?;
             c.ws(false);
+            if c.eat("?") {
+                c.ws(false);
+                if r || c.peek() != ':' {
+                    return c.fail("an optional parameter is a value parameter written `x?: T`");
+                }
+                p.push('?');
+            }
+            params.push(p);
             ptypes.push(if c.peek() == ':' {
                 c.bump();
                 c.ws(true);
@@ -615,7 +735,7 @@ pub fn parse_declarations(src: &str) -> R<Vec<JsDecl>> {
         if c.keyword("rejects") {
             c.ws(true);
             c.expect("(")?;
-            rejects = Some(parse_classes(&mut c)?.unwrap_or_else(|| vec!["Error".to_string()]));
+            rejects = Some(parse_class_list(&mut c, true)?.unwrap_or_else(|| vec!["Error".to_string()]));
             c.ws(true);
             c.expect(")")?;
         }
@@ -623,7 +743,7 @@ pub fn parse_declarations(src: &str) -> R<Vec<JsDecl>> {
         let written = c.keyword("instantiates");
         let instantiates = written || refs.iter().any(|x| *x) || shape.as_ref().is_some_and(|s| s.has_ref()); // MO-10a
         let shape = shape.unwrap_or(Shape::Part(Part::Value));
-        out.push(JsDecl::Fn { name, pure, params, rejects, line, side, ptypes, ret, refs, shape, instantiates });
+        out.push(JsDecl::Fn { name, pure, params, generics, rejects, line, side, ptypes, ret, refs, shape, instantiates });
     }
 }
 
@@ -888,6 +1008,15 @@ fn parse_decl_at(c: &mut Cursor) -> R<Decl> {
         return Ok(d);
     }
     if c.keyword("import") {
+        let start = c.i;
+        c.ws(true);
+        if c.keyword("type") {
+            c.ws(true);
+            if c.starts_with("{") {
+                return c.fail("declare the type with `export type` in the module's .d.rx, then use `import { T }` in .rx");
+            }
+        }
+        c.i = start;
         c.ws(true);
         let side = if IMPORT_SIDE.is_match(c.rest()) {
             if c.keyword("server") {
@@ -1055,6 +1184,7 @@ fn parse_decl_at(c: &mut Cursor) -> R<Decl> {
         c.expect("(")?;
         c.ws(true);
         let (params, ptypes) = params_typed(c)?;
+        if c.starts_with("=") { return c.fail("action parameter default"); }
         c.expect(")")?;
         c.ws(true);
         let body = parse_block(c)?;
@@ -1516,12 +1646,28 @@ fn parse_expr_no_catch(c: &mut Cursor) -> R<Expr> {
             c.ws(true);
             if c.peek() == '{' {
                 let at = c.i;
-                if let Ok(stmts) = parse_block(c) {
-                    if stmts.iter().any(|st| !matches!(&st.k, StmtKind::Expr(Expr { k: ExprKind::Id(_), .. }))) {
-                        return Ok(ex(start, ExprKind::Fn { params, body: Box::new(Expr::made(ExprKind::Lit(Lit::Undefined))), stmts: Some(stmts) }, c));
+                let stmt_err = match parse_block(c) {
+                    Ok(stmts) => {
+                        if stmts.iter().any(|st| !matches!(&st.k, StmtKind::Expr(Expr { k: ExprKind::Id(_), .. }))) {
+                            return Ok(ex(start, ExprKind::Fn { params, body: Box::new(Expr::made(ExprKind::Lit(Lit::Undefined))), stmts: Some(stmts) }, c));
+                        }
+                        None
                     }
-                }
+                    Err(e) => Some(e),
+                };
                 c.i = at;
+                // A handler is a statement body. If that reading fails and the record reading does too, report the
+                // statement error — the record reading fails at the first `let` and the hint then blames a local that is in a handler.
+                // The statement error wins when it names the habit. Otherwise the expression error does (`n++`), except
+                // JS_LOCAL, which the record reading blames on a `let` that is already in the handler.
+                return match parse_expr(c) {
+                    Ok(body) => Ok(ex(start, ExprKind::Fn { params, body: Box::new(body), stmts: None }, c)),
+                    Err(e) => Err(match stmt_err {
+                        Some(s) if s.3 != "PARSE" => s,
+                        Some(s) if e.3 == "PARSE" || e.3 == "JS_LOCAL" => s,
+                        _ => e,
+                    }),
+                };
             }
             let body = parse_expr(c)?;
             return Ok(ex(start, ExprKind::Fn { params, body: Box::new(body), stmts: None }, c));
@@ -1575,6 +1721,12 @@ fn parse_bin(c: &mut Cursor, lvl: usize) -> R<Expr> {
     let start = l.span.start as usize;
     loop {
         c.ws(false);
+        if lvl == 4 && c.keyword("as") {
+            c.ws(true);
+            let ty = assertion_type(c)?;
+            l = ex(start, ExprKind::As { e: Box::new(l), ty }, c);
+            continue;
+        }
         let op = LEVELS[lvl].iter().find(|o| c.starts_with(o) && !(**o == "-" && c.peek_at(1) == '>'));
         let Some(op) = op else { return Ok(l) };
         c.i += op.len();
@@ -1587,6 +1739,43 @@ fn parse_bin(c: &mut Cursor, lvl: usize) -> R<Expr> {
         };
         l = Expr::new(ExprKind::Bin { op: op.to_string(), l: Box::new(l), r: Box::new(r) }, Span::new(start, c.i));
     }
+}
+/// A type assertion ends at the surrounding expression's delimiter, not at a nested type delimiter.
+fn assertion_type(c: &mut Cursor) -> R<String> {
+    let start = c.i;
+    let mut end = start;
+    let mut stack = vec![];
+    while !c.eof() {
+        let ch = c.peek();
+        if stack.is_empty() && (",\n;:)=]}?+*/%!<>-".contains(ch) || c.starts_with("&&") || c.starts_with("||") || matches!(c.peek_ident().as_deref(), Some("as" | "catch"))) {
+            if ch != '<' { break; }
+            if type_params(c).is_err() { break; }
+            end = c.i;
+            continue;
+        }
+        if c.ident().is_some() { end = c.i; continue; }
+        if !stack.is_empty() && c.eat("=>") { end = c.i; continue; }
+        if matches!(ch, '\'' | '"' | '`') {
+            c.bump();
+            while !c.eof() && c.peek() != ch { c.eat("\\"); c.bump(); }
+            if c.eof() { return c.fail("unterminated string in type assertion"); }
+            c.bump();
+        } else {
+            match ch {
+                '(' => stack.push(')'),
+                '[' => stack.push(']'),
+                '{' => stack.push('}'),
+                '<' => stack.push('>'),
+                _ if stack.last() == Some(&ch) => { stack.pop(); }
+                _ => {}
+            }
+            c.bump();
+        }
+        if !ch.is_whitespace() { end = c.i; }
+    }
+    if end == start || !stack.is_empty() { return c.fail("type after `as`"); }
+    c.i = end;
+    Ok(c.src[start..end].to_string())
 }
 fn parse_unary(c: &mut Cursor) -> R<Expr> {
     c.ws(true);
@@ -1647,6 +1836,9 @@ fn parse_postfix(c: &mut Cursor) -> R<Expr> {
     let mut e = parse_primary(c)?;
     let start = e.span.start as usize;
     loop {
+        let save = c.i;
+        c.ws(true);
+        if !c.starts_with(".") && !c.starts_with("?.") { c.i = save; }
         if c.eat("?.") {
             if c.peek() == '[' {
                 c.bump();
@@ -1688,6 +1880,56 @@ fn parse_postfix(c: &mut Cursor) -> R<Expr> {
         }
     }
 }
+/// A quoted string or template's cooked escape (07 §3).
+fn string_escape(c: &mut Cursor, out: &mut String) -> R<()> {
+    fn hex(c: &mut Cursor, count: usize) -> R<u32> {
+        let Some(digits) = c.rest().get(..count).filter(|s| s.bytes().all(|b| b.is_ascii_hexdigit())) else {
+            return c.fail("expected hex digits in string escape");
+        };
+        c.i += count;
+        Ok(u32::from_str_radix(digits, 16).unwrap())
+    }
+    c.bump(); // backslash
+    if c.eof() { return c.fail("unterminated string escape"); }
+    let ch = c.peek();
+    c.bump();
+    out.push(match ch {
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'b' => '\x08',
+        'f' => '\x0c',
+        'v' => '\x0b',
+        '\r' => { c.eat("\n"); return Ok(()); }
+        '\n' | '\u{2028}' | '\u{2029}' => return Ok(()),
+        'x' => char::from_u32(hex(c, 2)?).unwrap(),
+        'u' => {
+            let cp = if c.eat("{") {
+                let start = c.i;
+                while c.peek().is_ascii_hexdigit() { c.bump(); }
+                if c.i == start { return c.fail("expected hex digits in string escape"); }
+                let digits = &c.src[start..c.i];
+                c.expect("}")?;
+                let digits = digits.trim_start_matches('0');
+                if digits.is_empty() { 0 } else { u32::from_str_radix(digits, 16).unwrap_or(u32::MAX) }
+            } else {
+                let high = hex(c, 4)?;
+                if (0xd800..=0xdbff).contains(&high) && c.eat("\\u") {
+                    let low = hex(c, 4)?;
+                    if !(0xdc00..=0xdfff).contains(&low) { return c.fail("invalid Unicode scalar in string escape"); }
+                    0x10000 + ((high - 0xd800) << 10) + low - 0xdc00
+                } else { high }
+            };
+            let Some(scalar) = char::from_u32(cp) else { return c.fail("invalid Unicode scalar in string escape"); };
+            scalar
+        }
+        '0' if !c.peek().is_ascii_digit() => '\0',
+        '0'..='9' => return c.fail("legacy numeric string escape"),
+        _ => ch,
+    });
+    Ok(())
+}
+
 fn parse_primary(c: &mut Cursor) -> R<Expr> {
     c.ws(true);
     let start = c.i;
@@ -1735,12 +1977,14 @@ fn parse_primary(c: &mut Cursor) -> R<Expr> {
                 continue;
             }
             if c.peek() == '\\' {
+                string_escape(c, &mut s)?;
+            } else if c.eat("\r") {
+                c.eat("\n");
+                s.push('\n');
+            } else {
+                s.push(c.peek());
                 c.bump();
             }
-            if !c.eof() {
-                s.push(c.peek());
-            }
-            c.bump();
         }
         c.expect("`")?;
         if !s.is_empty() || parts.is_empty() {
@@ -1753,12 +1997,11 @@ fn parse_primary(c: &mut Cursor) -> R<Expr> {
         let mut s = String::new();
         while !c.eof() && c.peek() != ch {
             if c.peek() == '\\' {
+                string_escape(c, &mut s)?;
+            } else {
+                s.push(c.peek());
                 c.bump();
             }
-            if !c.eof() {
-                s.push(c.peek());
-            }
-            c.bump();
         }
         c.expect(&ch.to_string())?;
         return Ok(ex(start, ExprKind::Lit(Lit::Str(s)), c));
@@ -1806,6 +2049,18 @@ fn parse_primary(c: &mut Cursor) -> R<Expr> {
                 if !c.eat(",") {
                     break;
                 }
+                c.ws(true);
+                continue;
+            }
+            if c.eat("[") {
+                let key = parse_expr(c)?;
+                c.ws(true);
+                c.expect("]")?;
+                c.ws(true);
+                c.expect(":")?;
+                fields.push(Field::Computed { key, v: parse_expr(c)? });
+                c.ws(true);
+                if !c.eat(",") { break; }
                 c.ws(true);
                 continue;
             }
@@ -1878,6 +2133,30 @@ enum Close {
     Tag(String),
 }
 
+/// Solid's trim_jsx_text, mirrored by ref/src/parse.ts. The text span covers the
+/// raw child; the AST carries its rendered value.
+pub(crate) fn jsx_text(s: &str) -> String {
+    let text = s.replace('\r', "");
+    let text = if text.contains('\n') {
+        text.split('\n').enumerate()
+            .map(|(i, l)| if i == 0 { l } else { l.trim_start_matches(char::is_whitespace) })
+            .filter(|l| !l.chars().all(char::is_whitespace))
+            .collect::<Vec<_>>().join(" ")
+    } else { text };
+    let mut s = String::new();
+    let mut whitespace = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !whitespace { s.push(' '); }
+            whitespace = true;
+        } else {
+            s.push(ch);
+            whitespace = false;
+        }
+    }
+    s
+}
+
 fn parse_markup(c: &mut Cursor, close: Close) -> R<Vec<Markup>> {
     let mut out: Vec<Markup> = vec![];
     let in_element = matches!(close, Close::Tag(_));
@@ -1886,21 +2165,8 @@ fn parse_markup(c: &mut Cursor, close: Close) -> R<Vec<Markup>> {
         Close::Brace => Some("}".to_string()),
         Close::Tag(t) => Some(t.clone()),
     };
-    let mut broke = false;
     loop {
-        let start = c.i;
-        if in_element {
-            let mut s = String::new();
-            while !c.eof() && " \t\r\n".contains(c.peek()) {
-                s.push(c.peek());
-                c.bump();
-            }
-            broke = s.contains('\n');
-            let tag = close_text.as_deref().unwrap();
-            if !s.is_empty() && !broke && !c.starts_with(&format!("</{}>", tag)) && !out.is_empty() {
-                out.push(Markup { kind: MarkupKind::Text(" ".into()), line: None, span: Span::NONE });
-            }
-        } else {
+        if !in_element {
             c.ws(true);
         }
         if c.eof() {
@@ -1956,24 +2222,14 @@ fn parse_markup(c: &mut Cursor, close: Close) -> R<Vec<Markup>> {
         if matches!(close, Close::Top) && looks_like_decl(c) {
             return c.fail("declaration after markup: a block is declarations, then its view");
         }
-        let mut s = String::new();
         let s0 = c.i;
-        while !c.eof() && !"<{}\n".contains(c.peek()) {
-            s.push(c.peek());
+        let stops = if in_element { "<{}" } else { "<{}\n" };
+        while !c.eof() && !stops.contains(c.peek()) {
             c.bump();
         }
-        if c.peek() == '\n' || c.eof() {
-            s = s.trim_end_matches([' ', '\t', '\r']).to_string();
-        }
+        let s = &c.src[s0..c.i];
         if !in_element {
-            if js_trim(&s).is_empty() {
-                if c.peek() == '\n' {
-                    c.bump();
-                }
-                if c.i == start {
-                    // the reference loops here forever (a stray `}`); this ends it
-                    return c.fail("expected a declaration or markup");
-                }
+            if !s.is_empty() && js_trim(s).is_empty() {
                 continue;
             }
             if s.contains(":=") {
@@ -1981,16 +2237,12 @@ fn parse_markup(c: &mut Cursor, close: Close) -> R<Vec<Markup>> {
             }
             return c.fail("expected a declaration or markup");
         }
-        if broke && matches!(out.last(), Some(Markup { kind: MarkupKind::Text(_), .. })) {
-            out.push(Markup { kind: MarkupKind::Text(" ".into()), line: None, span: Span::NONE });
-        }
-        if !s.is_empty() {
-            let span = Span::new(s0, s0 + s.len());
-            out.push(Markup { kind: MarkupKind::Text(s), line: None, span });
-        }
-        if c.i == start {
-            // the reference loops here forever (a stray `}` in an element); this ends it
+        if c.i == s0 {
             return c.fail("expected a declaration or markup");
+        }
+        let s = jsx_text(s);
+        if !s.is_empty() {
+            out.push(Markup { kind: MarkupKind::Text(s), line: None, span: Span::new(s0, c.i) });
         }
     }
 }

@@ -150,7 +150,7 @@ impl Spans<'_> {
                 sub(l);
                 sub(r);
             }
-            ExprKind::Un { e, .. } | ExprKind::Peek(e) | ExprKind::Latest(e) | ExprKind::Pending(e) | ExprKind::Spread(e) | ExprKind::Omit { e, .. } | ExprKind::Throw(e) => sub(e),
+            ExprKind::Un { e, .. } | ExprKind::As { e, .. } | ExprKind::Peek(e) | ExprKind::Latest(e) | ExprKind::Pending(e) | ExprKind::Spread(e) | ExprKind::Omit { e, .. } | ExprKind::Throw(e) => sub(e),
             ExprKind::Pre { init, .. } => init.iter().for_each(|x| sub(x)),
             ExprKind::Await { e, init, .. } => {
                 sub(e);
@@ -178,6 +178,7 @@ impl Spans<'_> {
             ExprKind::Arr(items) => items.iter().for_each(&mut sub),
             ExprKind::Rec(fields) => fields.iter().for_each(|f| match f {
                 Field::Kv { v, .. } => sub(v),
+                Field::Computed { key, v } => { sub(key); sub(v); }
                 Field::Spread(x) => sub(x),
             }),
             ExprKind::Catch { e, alt, .. } => {
@@ -231,7 +232,9 @@ impl Spans<'_> {
                 self.markups(children, at);
             }
             MarkupKind::Read(e) => self.expr(e, at),
-            MarkupKind::Text(t) if at.text(self.src) != t => self.bad(at, format!("the text {t:?} spans {:?}", at.text(self.src))),
+            MarkupKind::Text(t) if crate::parse::jsx_text(at.text(self.src)) != *t => {
+                self.bad(at, format!("the text {t:?} spans {:?}", at.text(self.src)))
+            }
             MarkupKind::Text(_) | MarkupKind::Style(_) => {}
             MarkupKind::Mif { c, t, t_decls, f, f_decls } => {
                 self.expr(c, at);
@@ -353,7 +356,7 @@ pub fn walk(p: &Program, f: &mut dyn FnMut(Span)) {
         match &e.k {
             ExprKind::Lit(_) | ExprKind::Id(_) | ExprKind::Use(_) | ExprKind::StyleMap { .. } => {}
             ExprKind::Bin { l, r, .. } => sub.extend([&**l, &**r]),
-            ExprKind::Un { e, .. } | ExprKind::Peek(e) | ExprKind::Latest(e) | ExprKind::Pending(e) | ExprKind::Spread(e) | ExprKind::Omit { e, .. } | ExprKind::Throw(e) => sub.push(e),
+            ExprKind::Un { e, .. } | ExprKind::As { e, .. } | ExprKind::Peek(e) | ExprKind::Latest(e) | ExprKind::Pending(e) | ExprKind::Spread(e) | ExprKind::Omit { e, .. } | ExprKind::Throw(e) => sub.push(e),
             ExprKind::Pre { init, .. } => sub.extend(init.iter().map(|x| &**x)),
             ExprKind::Await { e, init, .. } => sub.extend(std::iter::once(&**e).chain(init.iter().map(|x| &**x))),
             ExprKind::If { c, t, f } => sub.extend([&**c, &**t, &**f]),
@@ -362,10 +365,12 @@ pub fn walk(p: &Program, f: &mut dyn FnMut(Span)) {
             ExprKind::Index { o, i, .. } => sub.extend([&**o, &**i]),
             ExprKind::Call { f, args } => sub.extend(std::iter::once(&**f).chain(args.iter())),
             ExprKind::Arr(items) => sub.extend(items.iter()),
-            ExprKind::Rec(fields) => sub.extend(fields.iter().map(|x| match x {
-                Field::Kv { v, .. } => v,
-                Field::Spread(x) => x,
-            })),
+            ExprKind::Rec(fields) => for f in fields {
+                match f {
+                    Field::Kv { v, .. } | Field::Spread(v) => sub.push(v),
+                    Field::Computed { key, v } => sub.extend([key, v]),
+                }
+            },
             ExprKind::Catch { e, alt, .. } => sub.extend([&**e, &**alt]),
             ExprKind::Fn { body, stmts, .. } => {
                 sub.push(body);

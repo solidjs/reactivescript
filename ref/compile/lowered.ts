@@ -18,8 +18,11 @@ if (crate) execFileSync("cargo", ["build", "--release", "--quiet"], { cwd: fileU
 /** Throws CompileError when the program is not compiled; the caller has run the checker. */
 export function build(sc: Scenario, src: string, handlers: string[]): Built {
   if (!crate) {
-    const out = compileModules(moduleSet(sc, src), { extraStmts: handlers.map(h => { try { return parseStmts(h); } catch { return []; } }) });
-    return { entry: out.entry, css: out.css, views: t => lowerViews(out.files, t) };
+    const set = moduleSet(sc, src);
+    const extraStmts = handlers.map(h => { try { return parseStmts(h); } catch { return []; } });
+    const out = compileModules(set, { extraStmts });
+    const dev = process.env.RX_DEV === "1" ? compileModules(set, { extraStmts, dev: true }) : out;
+    return { entry: out.entry, css: out.css, views: t => lowerViews((t === "ssr" ? out : dev).files, t) };
   }
   const files: Record<string, string> = {};
   const read = (p: string) => { const s = p === sc.entry ? src : sc.modules.get(p) ?? (existsSync(p) && statSync(p).isFile() ? readFileSync(p, "utf8") : undefined); if (s !== undefined) files[p] = s; return s; };

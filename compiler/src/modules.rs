@@ -6,7 +6,7 @@ use crate::check::Diagnostic;
 use crate::parse::{parse_declarations, parse_program, JsDecl, ParseError};
 use crate::signature::{parse_signature, ModSig};
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct ModuleSet {
     pub entry: String,
@@ -15,6 +15,8 @@ pub struct ModuleSet {
     pub diags: Vec<Diagnostic>,
     /// MO-8, by `.d.rx` path
     pub declarations: IndexMap<String, Vec<JsDecl>>,
+    /// MO-8c: relative JS specifiers with a local module, keyed by joined path.
+    pub js_files: HashSet<String>,
     /// MO-9, by `.rx` path
     pub signatures: IndexMap<String, ModSig>,
     /// each program's text, which its spans index
@@ -61,6 +63,7 @@ struct Loader<'r> {
     order: Vec<String>,
     diags: Vec<Diagnostic>,
     declarations: IndexMap<String, Vec<JsDecl>>,
+    js_files: HashSet<String>,
     signatures: IndexMap<String, ModSig>,
     sources: HashMap<String, String>,
     state: HashMap<String, State>,
@@ -165,17 +168,22 @@ impl Loader<'_> {
         self.state.insert(path.to_string(), State::Busy);
         for d in p.decls.iter_mut() {
             let Decl::Import { from, line, resolved, declared, declared_errors, declared_pure, declared_side, .. } = d else { continue };
+            if !is_rx(from) && from.starts_with('.') {
+                let stem = join_path(path, from);
+                let exts = [".mjs", ".js", ".mts", ".ts", ".jsx", ".tsx", ".cjs", ".cts", ".json"];
+                if (self.read)(&stem).is_some()
+                    || exts.iter().any(|ext| (self.read)(&format!("{stem}{ext}")).is_some() || (self.read)(&format!("{stem}/index{ext}")).is_some())
+                    || (self.read)(&format!("{stem}/package.json")).is_some()
+                {
+                    self.js_files.insert(stem);
+                }
+            }
             // MO-10c: a package's declaration, beside the file it resolves to
             let pkg_dts = if !is_rx(from) && !from.starts_with('.') && !from.starts_with('/') { package_declaration(path, from, &*self.read) } else { None };
             if !is_rx(from) && (from.starts_with('.') || pkg_dts.is_some()) {
                 // MO-8: a JS module with a declaration file beside it
                 let dts = pkg_dts.unwrap_or_else(|| join_path(path, &(replace_js_ext(from) + ".d.rx")));
-                if !self.declarations.contains_key(&dts) {
-                    if let Some(src) = (self.read)(&dts) {
-                        let ds = parse_declarations(&src).map_err(|e| ParseError(format!("{}: {}", dts, e.0), e.1, Some(dts.clone()), e.3))?;
-                        self.declarations.insert(dts.clone(), ds);
-                    }
-                }
+                self.load_declaration(&dts)?;
                 if let Some(ds) = self.declarations.get(&dts) {
                     *declared = Some(dts.clone());
                     *declared_errors = Some(ds.iter().filter_map(|x| if let JsDecl::Error { name, .. } = x { Some(name.clone()) } else { None }).collect());
@@ -230,6 +238,111 @@ impl Loader<'_> {
         self.order.push(path.to_string());
         Ok(())
     }
+    /// MO-8: parse a `.d.rx` once, then resolve its type imports (MO-8e).
+    fn load_declaration(&mut self, dts: &str) -> Result<(), ParseError> {
+        if self.declarations.contains_key(dts) {
+            return Ok(());
+        }
+        let Some(src) = (self.read)(dts) else { return Ok(()) };
+        let ds = parse_declarations(&src).map_err(|e| ParseError(format!("{}: {}", dts, e.0), e.1, Some(dts.to_string()), e.3))?;
+        self.declarations.insert(dts.to_string(), ds);
+        self.resolve_decl_imports(dts)
+    }
+    /// MO-8e: `./x` in a `.d.rx` is `x.d.rx`, else `x.rx`. A path ending in `.rx` is that module.
+    fn decl_target(&self, from_file: &str, spec: &str) -> Option<(String, bool)> {
+        if !spec.starts_with('.') && !spec.starts_with('/') {
+            return None;
+        }
+        let s = spec.strip_suffix(".mjs").or_else(|| spec.strip_suffix(".js")).or_else(|| spec.strip_suffix(".ts")).unwrap_or(spec);
+        if let Some(p) = s.strip_suffix(".d.rx") {
+            let path = join_path(from_file, s);
+            let _ = p;
+            return (self.read)(&path).map(|_| (path, false));
+        }
+        if s.ends_with(".rx") {
+            let path = join_path(from_file, s);
+            return (self.read)(&path).map(|_| (path, true));
+        }
+        let stem = join_path(from_file, s);
+        let dts = format!("{stem}.d.rx");
+        if (self.read)(&dts).is_some() {
+            return Some((dts, false));
+        }
+        let rx = format!("{stem}.rx");
+        if (self.read)(&rx).is_some() {
+            return Some((rx, true));
+        }
+        None
+    }
+    fn resolve_decl_imports(&mut self, file: &str) -> Result<(), ParseError> {
+        let imports: Vec<(usize, String, Vec<crate::ast::ImportName>)> = self
+            .declarations
+            .get(file)
+            .map(|ds| ds.iter().filter_map(|d| if let JsDecl::Import { line, from, names, .. } = d { Some((*line, from.clone(), names.clone())) } else { None }).collect())
+            .unwrap_or_default();
+        let who = file.rsplit('/').next().unwrap_or(file).to_string();
+        for (line, from, names) in imports {
+            let Some((path, rx)) = self.decl_target(file, &from) else {
+                self.diags.push(Diagnostic { code: "MODULE_NOT_FOUND".into(), rule: "MO-8".into(), line: line as i64, file: Some(file.to_string()), msg: format!("{who}: no module {from} (a `.d.rx` imports types from a `.d.rx` or an `.rx`)") });
+                continue;
+            };
+            if let Some(ds) = self.declarations.get_mut(file) {
+                for d in ds.iter_mut() {
+                    if let JsDecl::Import { from: f, line: l, target, rx: r, .. } = d {
+                        if f == &from && *l == line && target.is_none() {
+                            *target = Some(path.clone());
+                            *r = rx;
+                        }
+                    }
+                }
+            }
+            if !rx {
+                self.load_declaration(&path)?;
+                let td = self.declarations.get(&path).cloned().unwrap_or_default();
+                let where_ = path.rsplit('/').next().unwrap_or(&path).to_string();
+                for n in &names {
+                    let x = td.iter().find(|y| y.name() == n.name && y.exported());
+                    match x {
+                        None => self.diags.push(Diagnostic { code: "NOT_EXPORTED".into(), rule: "MO-8".into(), line: line as i64, file: Some(file.to_string()), msg: format!("{who}: {where_} exports no type {}", n.name) }),
+                        Some(JsDecl::Fn { .. }) => self.diags.push(Diagnostic { code: "TYPE_IMPORT".into(), rule: "MO-8".into(), line: line as i64, file: Some(file.to_string()), msg: format!("{who}: `{}` is a value, not a type — a declaration file imports types only (`import {{ T }} from \"./x\"`)", n.name) }),
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if self.state.get(&path) != Some(&State::Done) && self.state.get(&path) != Some(&State::Busy) {
+                self.visit(&path, &[])?;
+            }
+            let kind = if let Some(p) = self.programs.get(&path) {
+                rx_export_kind(p, &names.iter().map(|n| n.name.clone()).collect::<Vec<_>>())
+            } else if let Some(src) = (self.read)(&path) {
+                parse_program(&src).map(|p| rx_export_kind(&p, &names.iter().map(|n| n.name.clone()).collect::<Vec<_>>())).unwrap_or_default()
+            } else {
+                vec![]
+            };
+            let where_ = path.rsplit('/').next().unwrap_or(&path);
+            for n in &names {
+                let k = kind.iter().find(|(name, _)| name == &n.name).map(|(_, k)| *k).unwrap_or("missing");
+                if k == "missing" {
+                    self.diags.push(Diagnostic { code: "NOT_EXPORTED".into(), rule: "MO-8".into(), line: line as i64, file: Some(file.to_string()), msg: format!("{who}: {where_} exports no type {}", n.name) });
+                } else if k == "value" {
+                    self.diags.push(Diagnostic { code: "TYPE_IMPORT".into(), rule: "MO-8".into(), line: line as i64, file: Some(file.to_string()), msg: format!("{who}: `{}` is a value, not a type — a declaration file imports types only (`import {{ T }} from \"./x\"`)", n.name) });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn rx_export_kind(p: &Program, names: &[String]) -> Vec<(String, &'static str)> {
+    names.iter().map(|name| {
+        let k = match p.decls.iter().find(|d| d.name() == Some(name) && d.exported()) {
+            Some(Decl::TypeDecl { .. }) => "type",
+            Some(_) => "value",
+            None => "missing",
+        };
+        (name.clone(), k)
+    }).collect()
 }
 
 /// Load `entry` and everything it imports from `.rx`. `read` returns a module's source, or `None` when there is none.
@@ -242,7 +355,7 @@ pub fn load_modules_recovering(entry: &str, read: &dyn Fn(&str) -> Option<String
     load(entry, read, true)
 }
 fn load(entry: &str, read: &dyn Fn(&str) -> Option<String>, recover: bool) -> Result<ModuleSet, ParseError> {
-    let mut l = Loader { read, programs: HashMap::new(), order: vec![], diags: vec![], declarations: IndexMap::new(), signatures: IndexMap::new(), sources: HashMap::new(), state: HashMap::new(), recover, parse_errors: vec![] };
+    let mut l = Loader { read, programs: HashMap::new(), order: vec![], diags: vec![], declarations: IndexMap::new(), js_files: HashSet::new(), signatures: IndexMap::new(), sources: HashMap::new(), state: HashMap::new(), recover, parse_errors: vec![] };
     l.visit(entry, &[])?;
-    Ok(ModuleSet { entry: entry.to_string(), programs: l.programs, order: l.order, diags: l.diags, declarations: l.declarations, signatures: l.signatures, sources: l.sources, parse_errors: l.parse_errors })
+    Ok(ModuleSet { entry: entry.to_string(), programs: l.programs, order: l.order, diags: l.diags, declarations: l.declarations, js_files: l.js_files, signatures: l.signatures, sources: l.sources, parse_errors: l.parse_errors })
 }

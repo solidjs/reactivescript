@@ -127,8 +127,15 @@ Added:
 | `===` / `!==` | accepted as `==` / `!=` | E-6 |
 | `use name` | the nearest provision above (a unary form: `(use x) == y`) | RG-7 |
 | `type T = …` | a TS type declaration, kept as text | — |
+| `e as T` | a type assertion, TypeScript's, erased at run time; the projection keeps it so the type layer checks it (13 TY-2). Same line as `e` — a newline is the next statement | TY-2 |
 | `throw e` | a failure, in either scope: `x > 0 ? x : throw BadInput(x)` (TC39's throw expression) | R-f-3 |
 | `await e catch (x: A \| B) => alt` | `alt` is the answer when the promise rejects with `A` or `B`; `catch (x) =>` takes every class; only after an `await` (`CATCH_NOT_ON_AWAIT`) | R-f-4 |
+
+String and template literals cook JavaScript's escapes: control escapes
+(`\n`, `\t`, etc.), escaped delimiters and backslashes, `\xHH`, `\uHHHH`,
+`\u{…}`, and backslash-newline continuations. A template's `\${` is text,
+not interpolation. Legacy numeric escapes and Unicode escapes that do not
+form a scalar (including an unpaired surrogate) are rejected.
 
 `await` may appear anywhere in an expression of reactive scope — an
 equation, a reader `{…}`, an attribute or prop, an `if` condition, a `for`
@@ -178,14 +185,13 @@ attributes are equations, children are readers, components are applied as
   where any of those reads go (R-2, R-f-5). On an HTML element it is read
   where the element is (S-surface-5).
 - `for x in e` keys rows by identity, or by the collection's `key` (ST-4b).
-- Text follows JSX: whitespace that contains a line break is not text, a
-  line's leading and trailing whitespace is not text, and text that runs
-  over two lines is joined by one space. Write `{" "}` where a space is
-  wanted between elements. (The first parser made every run of whitespace
-  between nodes a space; Solid's compiler — which lowers the views, 10 —
-  rejected the text it put inside a `<tr>`, which HTML forbids, and
-  S-app-users found it. 140 frames in 15 scenarios lost spaces that were
-  only formatting.)
+- Text follows Solid's JSX: within each text child, ignore carriage
+  returns, strip continuation-line indentation, drop blank lines in
+  multiline text, and join the remaining lines with one space. Runs of
+  whitespace collapse to one space. Same-line whitespace survives,
+  including at the edge of an element (`<span> note</span>`) and next to a
+  child (`<b>x</b> text`). Write `{" "}` to force a space across a line
+  break between elements.
 - `errored fallback(e)` binds the error value; `fallback` without a
   parameter ignores it. `fallback(e: A | B)` takes only those classes;
   others pass to the boundary above (R-f-4). `fallback(e: Panic)` takes
@@ -325,7 +331,10 @@ component Card(props) {
   children the view passes to a component — carries the view's scope class.
   A component's body is its own view, with its own stylesheet or none.
   Children belong to the view that wrote them, wherever the component
-  places them.
+  places them. A class in one component's `<style>` that matches an
+  element of another component in the same file does not style it
+  (`STYLE_SCOPE`): that component is its own view. Give it its own
+  `<style>`, or pass a class map (CSS-5).
 - **CSS-3 (The stylesheet).** TSRX's engine, unchanged (`tsrx::style` in
   Solid's compiler; 11 CP-1d): selectors are scoped to the class
   (`tsrx-` and eight hex digits of the module, the style's position and its

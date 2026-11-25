@@ -8,6 +8,7 @@ use crate::ast::{Decl, Expr, ExprKind, Lit, Markup, MarkupKind, PathSeg, Program
 use crate::awaits::{inner_catches, is_handler, non_tail_awaits, view_readers};
 use crate::check::{children, unwrap_server, Node};
 use crate::js::*;
+use crate::model::{decl_keys, module_key};
 use crate::modules::ModuleSet;
 use crate::parse::{JsDecl, Part, Shape as FShape};
 use crate::signature::ExportSig;
@@ -199,9 +200,25 @@ pub fn compile_modules(set: &ModuleSet, extra: &[Vec<Stmt>]) -> R<Compiled> {
 /// `compile_modules`, with each module importing its dependencies by their `.rx` paths (relative to the importer) when
 /// `by_source`, as a bundler resolves them, rather than as the sibling `.mjs` files `compile_modules` names.
 pub fn compile_linked(set: &ModuleSet, extra: &[Vec<Stmt>], by_source: bool) -> R<Compiled> {
+    compile_dev(set, extra, by_source, None)
+}
+
+/// `compile_linked` for a dev build when `dev` is set: each source's and equation's creating calls run under its key
+/// (`__rt.key(k, () => …)`, model.rs `decl_keys`), so the runtime names their Solid nodes. `dev`: the project root the
+/// key's module is relative to (`""`: the path as the loader has it).
+pub fn compile_dev(set: &ModuleSet, extra: &[Vec<Stmt>], by_source: bool, dev: Option<&str>) -> R<Compiled> {
+    compile_into(set, extra, by_source, dev, None)
+}
+
+/// For a sibling-file build written elsewhere, keep relative JS imports relative to their RX importer.
+pub fn compile_into(set: &ModuleSet, extra: &[Vec<Stmt>], by_source: bool, dev: Option<&str>, out_dir: Option<&str>) -> R<Compiled> {
     let programs: Vec<&Program> = set.order.iter().map(|p| &set.programs[p]).collect();
     let mut g = Gen::new(usage(&programs, extra), set);
     g.by_source = by_source;
+    g.out_dir = out_dir;
+    if dev.is_some() {
+        g.boundaries = crate::check::boundary_regions(set);
+    }
     let mut files = IndexMap::new();
     let mut paths = IndexMap::new();
     let mut module_css = IndexMap::new();
@@ -209,6 +226,11 @@ pub fn compile_linked(set: &ModuleSet, extra: &[Vec<Stmt>], by_source: bool) -> 
         let p = &set.programs[path];
         let css0 = g.css.len();
         g.begin_module(path, &p.decls);
+        g.dev_module = dev.map(|root| module_key(path, Some(root))).unwrap_or_default();
+        g.keys = match dev {
+            Some(root) => decl_keys(p, &module_key(path, Some(root))),
+            None => HashMap::new(),
+        };
         let mut deps: Vec<&str> = vec![];
         for d in &p.decls {
             if let Decl::Import { resolved: Some(r), .. } = d {
@@ -222,14 +244,15 @@ pub fn compile_linked(set: &ModuleSet, extra: &[Vec<Stmt>], by_source: bool) -> 
             let root = g.new_env(None);
             let inner = g.block(&p.decls, &p.view, root, None, true)?;
             body.append(&mut g.top);
-            body.push(S::ExportDefault(Func {
+            let main = Func {
                 name: Some("main".into()),
                 params: vec![P::Id("__rt".into())],
                 directives: vec![],
                 body: vec![konst("__B", dot(id("__rt"), "B")), S::Return(Some(arrow_block(vec![], inner, false)))],
                 is_async: false,
                 generator: false,
-            }));
+            };
+            body.push(S::ExportDefault(main));
         } else {
             let exported: Vec<&str> = p.decls.iter().filter(|d| d.exported() && !matches!(d, Decl::TypeDecl { .. })).filter_map(|d| d.name()).collect();
             let is_comp = |n: &str| p.decls.iter().any(|d| matches!(d, Decl::Component { name, .. } if name == n));
@@ -254,6 +277,7 @@ struct Gen<'p> {
     file: String,
     /// Modules imported by source path, for a bundler (`compile_linked`), not as sibling `.mjs` files.
     by_source: bool,
+    out_dir: Option<&'p str>,
     css: Vec<String>,
     /// module-level code: hoisted server functions and the module's error classes
     top: Vec<S>,
@@ -269,6 +293,10 @@ struct Gen<'p> {
     hoist_seq: usize,
     frames: Vec<Frame>,
     style_ids: u32,
+    /// dev: each declaration's key (model.rs `decl_keys`); empty otherwise
+    keys: HashMap<*const Decl, String>,
+    boundaries: HashMap<*const Markup, usize>,
+    dev_module: String,
 }
 
 /// MO-10: the scenario prelude's `./prims`, a JS module of Solid primitives (`ref/compile/prims-solid.ts`).
@@ -277,11 +305,25 @@ fn is_prims(from: &str) -> bool {
 }
 
 impl<'p> Gen<'p> {
-    /// A JS import that becomes a real ES import (MO-8): a package's always; a relative one too when the modules go to a
-    /// bundler (`by_source`, the product), where `./util.js` is the app's own file. `./api` stays the app's injected API
-    /// (`createApp({ api })`, CP-4), and in the scenario runners every relative import is the harness's.
-    fn js_import(&self, from: &str) -> bool {
-        !from.starts_with('.') || (self.by_source && !from.ends_with("/api"))
+    fn local_js(&self, from: &str) -> bool {
+        from.starts_with('.') && self.set.js_files.contains(&crate::modules::join_path(&self.file, from))
+    }
+    /// A real file wins even if its name (or one of its exports) is in the scenario prelude (MO-8c).
+    fn real_import(&self, from: &str, name: &str) -> bool {
+        if self.local_js(from) {
+            return true;
+        }
+        let product = self.by_source || self.out_dir.is_some();
+        (!from.starts_with('.') || (product && from != "./api")) && !builtin(name) && name != "log"
+    }
+    fn js_decl(&self, declared: Option<&str>, name: &str) -> Option<&'p JsDecl> {
+        self.set.declarations.get(declared?).and_then(|ds| ds.iter().find(|x| x.name() == name))
+    }
+    fn js_specifier(&self, from: &str) -> String {
+        if let Some(dir) = self.out_dir.filter(|_| from.starts_with('.')) {
+            return relative(&format!("{dir}/main.mjs"), &crate::modules::join_path(&self.file, from));
+        }
+        from.to_string()
     }
     fn new(u: Usage, set: &'p ModuleSet) -> Self {
         Gen {
@@ -289,6 +331,7 @@ impl<'p> Gen<'p> {
             set,
             file: "main.rx".into(),
             by_source: false,
+            out_dir: None,
             css: vec![],
             top: vec![],
             top_fns: HashSet::new(),
@@ -301,6 +344,9 @@ impl<'p> Gen<'p> {
             hoist_seq: 0,
             frames: vec![],
             style_ids: 0,
+            keys: HashMap::new(),
+            boundaries: HashMap::new(),
+            dev_module: String::new(),
         }
     }
     // ---- environments
@@ -366,13 +412,10 @@ impl<'p> Gen<'p> {
         }
         // a package's JS (`@solidjs/web/server-functions`): a real import at module level, where a hoisted server fn's wrappers are
         for d in decls {
-            if let Decl::Import { resolved: None, from, names, .. } = d {
-                if !self.js_import(from) {
-                    continue;
-                }
-                let ns: Vec<(String, String)> = names.iter().filter(|n| !builtin(&n.name) && n.name != "log").map(|n| (n.name.clone(), format!("w${}", n.alias))).collect();
+            if let Decl::Import { resolved: None, from, names, declared, .. } = d {
+                let ns: Vec<(String, String)> = names.iter().filter(|n| self.real_import(from, &n.name) && !matches!(self.js_decl(declared.as_deref(), &n.name), Some(JsDecl::Type { .. }))).map(|n| (n.name.clone(), format!("w${}", n.alias))).collect();
                 if !ns.is_empty() {
-                    self.top.push(S::ImportNamed(ns, from.clone()));
+                    self.top.push(S::ImportNamed(ns, self.js_specifier(from)));
                 }
             }
         }
@@ -390,7 +433,7 @@ impl<'p> Gen<'p> {
             ExprKind::ServerFn { params, body, .. } => self.server_hoist(name, params, body, true),
             ExprKind::Call { f, args } if matches!(&f.k, ExprKind::Id(_)) => {
                 let ExprKind::Id(fname) = &f.k else { unreachable!() };
-                let found = self.mod_decls.iter().any(|d| matches!(d, Decl::Import { resolved: None, from, names, .. } if self.js_import(from) && names.iter().any(|n| &n.alias == fname)));
+                let found = self.mod_decls.iter().any(|d| matches!(d, Decl::Import { resolved: None, from, names, .. } if names.iter().any(|n| &n.alias == fname && (self.real_import(from, &n.name) || !from.starts_with('.')))));
                 if !found {
                     return fail(format!("{name}: a server fn's wrapper is a package's function (here, {fname})"));
                 }
@@ -426,13 +469,16 @@ impl<'p> Gen<'p> {
         let decls = self.mod_decls;
         for x in decls {
             match x {
-                Decl::Import { resolved: None, names, from, declared_errors, .. } => {
+                Decl::Import { resolved: None, names, from, declared, declared_errors, .. } => {
                     for n in names {
-                        if n.name == "log" || builtin(&n.name) {
+                        if matches!(self.js_decl(declared.as_deref(), &n.name), Some(JsDecl::Type { .. })) {
                             continue;
                         }
-                        if self.js_import(from) {
+                        if self.real_import(from, &n.name) {
                             self.set(env, &n.alias, val(format!("w${}", n.alias)));
+                            continue;
+                        }
+                        if n.name == "log" || builtin(&n.name) {
                             continue;
                         }
                         self.set(env, &n.alias, val(mg(&n.alias)));
@@ -634,7 +680,10 @@ impl<'p> Gen<'p> {
                 Decl::Import { names, side, declared_side, declared, .. } => {
                     for n in names {
                         // MO-10a: a declared primitive
-                        let x = declared.as_ref().and_then(|dp| self.set.declarations.get(dp)).and_then(|ds| ds.iter().find(|y| y.name() == n.name));
+                        let x = self.js_decl(declared.as_deref(), &n.name);
+                        if matches!(x, Some(JsDecl::Type { .. })) {
+                            continue;
+                        }
                         if let Some(JsDecl::Fn { params, refs, shape, instantiates: true, .. }) = x {
                             let mut b = bind(Kind::Jfn, mg(&n.alias));
                             b.f = Some(FnRef { params: params.iter().enumerate().map(|(i, p)| (p.clone(), refs.get(i).copied().unwrap_or(false))).collect(), decl: None });
@@ -684,11 +733,14 @@ impl<'p> Gen<'p> {
             }
         }
         for d in decls {
-            let Decl::Import { resolved: None, names, from, declared_errors, .. } = d else { continue };
+            let Decl::Import { resolved: None, names, from, declared, declared_errors, .. } = d else { continue };
             let n0 = out.len();
             for n in names {
                 let (name, alias) = (&n.name, &n.alias);
-                let v = if self.js_import(from) && !builtin(name) && name != "log" {
+                if matches!(self.js_decl(declared.as_deref(), name), Some(JsDecl::Type { .. })) {
+                    continue;
+                }
+                let v = if self.real_import(from, name) {
                     id(format!("w${alias}"))
                 } else if name == "log" {
                     dot(id("__B"), "log")
@@ -696,7 +748,7 @@ impl<'p> Gen<'p> {
                     rtc("jsError", vec![str(name.clone())])
                 } else if builtin(name) {
                     dot(id("__B"), name)
-                } else if from.ends_with("/api") {
+                } else if from == "./api" {
                     rtc("api", vec![str(name.clone())])
                 } else if is_prims(from) {
                     // MO-10: the scenario prelude's Solid primitives
@@ -769,7 +821,11 @@ impl<'p> Gen<'p> {
             let penv = self.params(env, params);
             let body = self.stmts(body, penv, &Ctx { imp: true, gen: true, ..Ctx::default() }, false)?;
             let gen = E::Func(Box::new(Func { name: None, params: params.iter().map(|p| P::Id(mg(p))).collect(), directives: vec![], body, is_async: false, generator: true }));
-            out.push(konst(mg(name), rtc("action", vec![gen])));
+            let mut args = vec![gen];
+            if let Some(k) = self.keys.get(&(d as *const Decl)) {
+                args.push(str(k.clone()));
+            }
+            out.push(konst(mg(name), rtc("action", args)));
             out.push(sexpr(rtc("reg", vec![str(name.clone()), obj(vec![("value", id(mg(name)))])])));
             at(&mut out, n0, d.line());
         }
@@ -927,11 +983,12 @@ impl<'p> Gen<'p> {
         }
         let name = d.name().unwrap();
         let b = self.frames[env].vars.get(name).unwrap().clone();
+        let key = self.keys.get(&(d as *const Decl)).cloned();
         let mut out = match d {
-            Decl::Source { question: true, init, .. } => self.hoist(Some(name), init, env, true)?,
+            Decl::Source { question: true, init, .. } => self.hoist_under(Some(name), init, env, true, key.as_deref())?,
             Decl::Eq { e, .. } if !matches!(&e.k, ExprKind::Draft { .. }) => {
-                let mut v = self.hoist(Some(name), e, env, true)?;
-                v.append(&mut self.hoist_catches(name, e, env)?);
+                let mut v = self.hoist_under(Some(name), e, env, true, key.as_deref())?;
+                v.append(&mut self.hoist_catches(name, e, env, key.as_deref())?);
                 v
             }
             _ => vec![],
@@ -942,6 +999,16 @@ impl<'p> Gen<'p> {
     /// 07 §3 / R-1: each `await` that is not the equation's result is its own async memo, asked only while the conditions that
     /// reach it hold (E-11, awaits.rs); the equation reads it where the `await` was.
     fn hoist(&mut self, name: Option<&str>, e: &Expr, env: Env, tail: bool) -> R<Vec<S>> {
+        self.hoist_under(name, e, env, tail, None)
+    }
+    /// dev: a keyed declaration's creating call, run under its key.
+    fn under(key: Option<&str>, call: E) -> E {
+        match key {
+            Some(k) => rtc("key", vec![str(k), thunk(call)]),
+            None => call,
+        }
+    }
+    fn hoist_under(&mut self, name: Option<&str>, e: &Expr, env: Env, tail: bool, key: Option<&str>) -> R<Vec<S>> {
         let mut out = vec![];
         for h in non_tail_awaits(e, tail) {
             let v = format!("a${}${}", name.unwrap_or(""), self.hoist_seq);
@@ -968,7 +1035,7 @@ impl<'p> Gen<'p> {
                 let c = it.fold(first, |a, b| bin("&&", a, b));
                 E::Cond(Box::new(c), Box::new(body), Box::new(undef()))
             };
-            out.push(konst(v.clone(), rtc("memo", vec![name.map(str).unwrap_or(E::Null), thunk(f), lv])));
+            out.push(konst(v.clone(), Self::under(key, rtc("memo", vec![name.map(str).unwrap_or(E::Null), thunk(f), lv]))));
             if let Some(n) = name {
                 out.push(sexpr(rtc("hoisted", vec![str(n), id(v)])));
             }
@@ -976,7 +1043,7 @@ impl<'p> Gen<'p> {
         Ok(out)
     }
     /// R-f-4: each catch inside an equation gets one boundary, made once beside it (awaits.rs `inner_catches`).
-    fn hoist_catches(&mut self, name: &str, e: &Expr, env: Env) -> R<Vec<S>> {
+    fn hoist_catches(&mut self, name: &str, e: &Expr, env: Env, key: Option<&str>) -> R<Vec<S>> {
         let mut out = vec![];
         for h in inner_catches(e) {
             let ExprKind::Catch { e: x, name: cn, classes, alt } = &h.node.k else { unreachable!() };
@@ -1004,7 +1071,7 @@ impl<'p> Gen<'p> {
                 E::Cond(Box::new(c), Box::new(body), Box::new(undef()))
             };
             self.hoisted_catch.insert(h.node as *const Expr, v.clone());
-            out.push(konst(v, rtc("catchMemo", vec![thunk(f), arrow(&["__e"], rtc("isA", vec![id("__e"), cls])), arrow(&[&p], a)])));
+            out.push(konst(v, Self::under(key, rtc("catchMemo", vec![thunk(f), arrow(&["__e"], rtc("isA", vec![id("__e"), cls])), arrow(&[&p], a)]))));
         }
         Ok(out)
     }
@@ -1022,14 +1089,17 @@ impl<'p> Gen<'p> {
             }
         };
         let pair = || Pat::Arr(vec![b.js.clone(), b.w.clone().unwrap()]);
+        let rx_key = self.keys.get(&(d as *const Decl)).cloned();
+        let k = |call: E| Self::under(rx_key.as_deref(), call);
         match d {
             Decl::Source { name, init, question: false, .. } => {
                 let x = self.expr(init, env, &reactive())?;
-                let mut args = vec![str(name.clone()), rtc("untrack", vec![thunk(x)])];
+                let init = thunk(x);
+                let mut args = vec![str(name.clone()), if rx_key.is_some() { init } else { rtc("untrack", vec![init]) }];
                 if self.u.optimistic.contains(name) {
                     args.push(E::Bool(true)); // AC-3: a guess over a writable — an optimistic layer derived from it
                 }
-                let mut out = vec![S::Const(pair(), rtc("source", args)), self.reg(name, b, true)];
+                let mut out = vec![S::Const(pair(), k(rtc(if rx_key.is_some() { "sourceDev" } else { "source" }, args))), self.reg(name, b, true)];
                 prev(&mut out);
                 Ok(out)
             }
@@ -1041,7 +1111,7 @@ impl<'p> Gen<'p> {
                 if let Some(k) = key {
                     args.push(str(k.clone()));
                 }
-                let mut out = vec![S::Const(pair(), rtc("question", args)), self.reg(name, b, true)];
+                let mut out = vec![S::Const(pair(), k(rtc("question", args))), self.reg(name, b, true)];
                 prev(&mut out);
                 Ok(out)
             }
@@ -1056,7 +1126,7 @@ impl<'p> Gen<'p> {
                 if let Some(k) = key {
                     args.push(str(k.clone()));
                 }
-                let mut out = vec![S::Const(pair(), rtc("question", args)), self.reg(name, b, true)];
+                let mut out = vec![S::Const(pair(), k(rtc("question", args))), self.reg(name, b, true)];
                 prev(&mut out);
                 Ok(out)
             }
@@ -1076,23 +1146,23 @@ impl<'p> Gen<'p> {
                     self.set(inner, "d", val("v$d"));
                     let s = self.expr(si, env, &reactive())?;
                     let db = self.draft_body(body, inner)?;
-                    return fin(vec![konst(b.js.clone(), rtc("draft", vec![rtc("untrack", vec![thunk(s)]), arrow_block(vec![P::Id("v$d".into())], db, false)]))], self);
+                    return fin(vec![konst(b.js.clone(), k(rtc("draft", vec![rtc("untrack", vec![thunk(s)]), arrow_block(vec![P::Id("v$d".into())], db, false)])))], self);
                 }
                 // RG-6
                 if let ExprKind::Call { f, .. } = &e.k {
                     if let ExprKind::Id(fname) = &f.k {
                         if self.lookup(env, fname).is_some_and(|x| x.kind == Kind::Ifn) {
                             let v = self.instantiate(e, env)?;
-                            return fin(vec![konst(b.js.clone(), v)], self);
+                            return fin(vec![konst(b.js.clone(), k(v))], self);
                         }
                     }
                 }
-                if let Some(fx) = self.foreign(e, env, &b)? {
+                if let Some(fx) = self.foreign(e, env, &b, rx_key.as_deref())? {
                     return fin(fx, self);
                 }
-                if let Some(k) = key {
+                if let Some(sk) = key {
                     let x = self.expr(e, env, &Ctx { tail: true, ..Ctx::default() })?;
-                    return fin(vec![konst(b.js.clone(), rtc("keyed", vec![str(name.clone()), str(k.clone()), thunk(x), E::Bool(matches!(e.k, ExprKind::Rec(_)))]))], self);
+                    return fin(vec![konst(b.js.clone(), k(rtc("keyed", vec![str(name.clone()), str(sk.clone()), thunk(x), E::Bool(matches!(e.k, ExprKind::Rec(_)))])))], self);
                 }
                 // R-f-4 over a tail await: the flight is an inner memo, read through a boundary
                 if let (ExprKind::Catch { e: ce, name: cn, classes, alt }, false) = (&e.k, deferred) {
@@ -1113,20 +1183,20 @@ impl<'p> Gen<'p> {
                         x
                     };
                     let out = vec![
-                        konst(i.clone(), rtc("memo", vec![str(name.clone()), arrow(&["__prev"], body), lv])),
+                        konst(i.clone(), k(rtc("memo", vec![str(name.clone()), arrow(&["__prev"], body), lv]))),
                         konst(
                             b.js.clone(),
-                            rtc(
+                            k(rtc(
                                 "catchMemo",
                                 vec![thunk(call(id(i), vec![])), arrow(&["__e"], rtc("isA", vec![id("__e"), cls])), arrow(&[&pn], a)],
-                            ),
+                            )),
                         ),
                     ];
                     return fin(out, self);
                 }
                 let x = self.expr(e, env, &Ctx { tail: true, self_: Some(name.clone()), ..Ctx::default() })?;
                 let lv = self.loading_value(e, env)?;
-                fin(vec![konst(b.js.clone(), rtc(if *deferred { "deferred" } else { "memo" }, vec![str(name.clone()), arrow(&["__prev"], x), lv]))], self)
+                fin(vec![konst(b.js.clone(), k(rtc(if *deferred { "deferred" } else { "memo" }, vec![str(name.clone()), arrow(&["__prev"], x), lv])))], self)
             }
             _ => fail("unreachable"),
         }
@@ -1232,7 +1302,7 @@ impl<'p> Gen<'p> {
     /// MO-10: `x = f(…)` over a declared primitive — called once (RG-6), a ref argument as an accessor, a value one
     /// untracked; and `y = x[i]` / `x.k` over its result. A `ref` part is bound to the accessor itself, any other part to
     /// its value.
-    fn foreign(&mut self, e: &Expr, env: Env, b: &Bind) -> R<Option<Vec<S>>> {
+    fn foreign(&mut self, e: &Expr, env: Env, b: &Bind, rx_key: Option<&str>) -> R<Option<Vec<S>>> {
         fn part(r: E, p: Part) -> E {
             if p == Part::Ref {
                 r
@@ -1240,6 +1310,11 @@ impl<'p> Gen<'p> {
                 thunk(r)
             }
         }
+        // Observe a foreign accessor through a named dev memo; the foreign
+        // primitive itself stays owned by the JS adapter and is called once.
+        let observed = |r: E, p: Part| if rx_key.is_some() && p == Part::Ref {
+            rtc("observeRef", vec![r])
+        } else { part(r, p) };
         let ix = |r: &str, k: E| E::Index(Box::new(id(r)), Box::new(k), false);
         match &e.k {
             ExprKind::Call { f, args } => {
@@ -1262,7 +1337,7 @@ impl<'p> Gen<'p> {
                 }
                 let r = b.inst.clone().unwrap();
                 let whole = match fb.shape.as_ref().unwrap() {
-                    FShape::Part(p) => part(id(r.clone()), *p),
+                    FShape::Part(p) => observed(id(r.clone()), *p),
                     FShape::Items(items) => rtc(
                         "memo",
                         vec![E::Null, thunk(E::Arr(items.iter().enumerate().map(|(i, p)| { let x = ix(&r, E::Num(i as f64)); if *p == Part::Ref { call(x, vec![]) } else { x } }).collect()))],
@@ -1272,7 +1347,7 @@ impl<'p> Gen<'p> {
                         vec![E::Null, thunk(E::Obj(fields.iter().map(|(k, p)| { let x = ix(&r, str(k.clone())); Prop::Kv(Key::Str(k.clone()), if *p == Part::Ref { call(x, vec![]) } else { x }) }).collect()))],
                     ),
                 };
-                Ok(Some(vec![konst(r.clone(), call(id(fb.js.clone()), out)), konst(b.js.clone(), whole)]))
+                Ok(Some(vec![konst(r.clone(), call(id(fb.js.clone()), out)), konst(b.js.clone(), Self::under(rx_key, whole))]))
             }
             ExprKind::Index { o, .. } | ExprKind::Member { o, .. } => {
                 let ExprKind::Id(on) = &o.k else { return Ok(None) };
@@ -1292,7 +1367,7 @@ impl<'p> Gen<'p> {
                     },
                     _ => return Ok(None),
                 };
-                Ok(Some(vec![konst(b.js.clone(), part(ix(&inst, key), p))]))
+                Ok(Some(vec![konst(b.js.clone(), Self::under(rx_key, observed(ix(&inst, key), p)))]))
             }
             _ => Ok(None),
         }
@@ -1348,6 +1423,7 @@ impl<'p> Gen<'p> {
                 rtc("preOr", vec![call(id(p), vec![]), thunk(i)])
             }
             ExprKind::Peek(x) => rtc("untrack", vec![thunk(self.expr(x, env, &sub)?)]),
+            ExprKind::As { e: x, .. } => self.expr(x, env, &sub)?,
             // RG-4b: Solid's live view
             ExprKind::Omit { e: x, keys } => rtc("omit", std::iter::once(self.expr(x, env, &sub)).chain(keys.iter().map(|k| Ok(str(k.clone())))).collect::<Result<Vec<_>, _>>()?),
             ExprKind::Await { e: x, stream, .. } => {
@@ -1463,6 +1539,7 @@ impl<'p> Gen<'p> {
                     ps.push(match f {
                         crate::ast::Field::Spread(x) => Prop::Spread(self.expr(x, env, &sub)?),
                         crate::ast::Field::Kv { key, v } => Prop::Kv(Key::Str(key.clone()), self.expr(v, env, &sub)?),
+                        crate::ast::Field::Computed { key, v } => Prop::Kv(Key::Computed(Box::new(self.expr(key, env, &sub)?)), self.expr(v, env, &sub)?),
                     });
                 }
                 E::Obj(ps)
@@ -1470,7 +1547,7 @@ impl<'p> Gen<'p> {
             ExprKind::Fn { params, body, stmts } => {
                 let inner = self.params(env, params);
                 let ps: Vec<P> = params.iter().map(|p| P::Id(mg(p))).collect();
-                match stmts {
+                let f = match stmts {
                     Some(ss) if crate::infer::inferred_action(ss).is_some() => {
                         // AC-1b: an inferred action lowers as `action { … }` does, to Solid's action()
                         let b = self.stmts(ss, inner, &Ctx { imp: true, gen: true, dynamic: ctx.dynamic, effect: ctx.effect, ..Ctx::default() }, false)?;
@@ -1486,7 +1563,8 @@ impl<'p> Gen<'p> {
                         let b = self.expr(body, inner, &Ctx { imp: ctx.imp, dynamic: ctx.dynamic, effect: ctx.effect, ..Ctx::default() })?;
                         E::Arrow { params: ps, body: Body::Expr(Box::new(b)), is_async: false }
                     }
-                }
+                };
+                if ctx.imp && !self.dev_module.is_empty() { rtc("traceCallback", vec![f]) } else { f }
             }
             ExprKind::Use(n) => rtc("useGet", vec![self.reference(n, env, &Ctx { dynamic: ctx.dynamic, ..Ctx::default() })?, id("__o")]),
             ExprKind::Bin { op, l, r } => {
@@ -1509,6 +1587,7 @@ impl<'p> Gen<'p> {
             return Ok(E::Index(Box::new(id("$p")), Box::new(E::Num(name[1..].parse::<f64>().unwrap())), false));
         }
         let Some(b) = self.lookup(env, name) else {
+            if crate::check::pure_global(name, None) { return Ok(id(name)); }
             if builtin(name) {
                 return Ok(dot(id("__B"), name));
             }
@@ -1741,7 +1820,7 @@ impl<'p> Gen<'p> {
             MarkupKind::Read(e) => Child::Expr(rtc("show", vec![self.expr(e, env, &re)?])),
             MarkupKind::El { tag, children, .. } if tag.is_empty() => {
                 if children.is_empty() {
-                    Child::Text("null".into())
+                    Child::Expr(E::Null)
                 } else {
                     Child::Jsx(Jsx::Frag(self.kids(children, env)?, line))
                 }
@@ -1802,13 +1881,19 @@ impl<'p> Gen<'p> {
             }
             MarkupKind::Loading { on, fallback, decls, body } => {
                 let mut xs = vec![];
+                let tag = if let Some(id) = self.boundaries.get(&(m as *const Markup)) {
+                    xs.push(("region".into(), AttrValue::Expr(str(format!("{}|{id}", self.dev_module)))));
+                    JsxName::Member("__rt".into(), "DevLoading".into())
+                } else {
+                    JsxName::Ident("Loading".into())
+                };
                 if let Some(o) = on {
                     xs.push(("on".to_string(), AttrValue::Expr(self.expr(o, env, &re)?)));
                 }
                 let fb = self.markup(fallback, env)?;
                 xs.push(("fallback".into(), AttrValue::Expr(fb)));
                 let r = self.region(decls, body, env)?;
-                el(JsxName::Ident("Loading".into()), xs, vec![r], false)
+                el(tag, xs, vec![r], false)
             }
             // RG-8: Solid's Portal (the web's, or the test renderer's)
             MarkupKind::Portal { to, decls, body } => {
@@ -1828,14 +1913,20 @@ impl<'p> Gen<'p> {
                 let p = err_name.as_ref().map(|n| mg(n)).unwrap_or("__err".into());
                 let fallback = ("fallback".to_string(), AttrValue::Expr(arrow(&[&p], fm)));
                 let b = self.region(decls, body, env)?;
+                let region = self.boundaries.get(&(m as *const Markup));
+                let mut attrs = region.map(|id| vec![("region".into(), AttrValue::Expr(str(format!("{}|{id}", self.dev_module))))]).unwrap_or_default();
                 // R-f-4: a typed boundary passes other classes up
-                match classes {
+                let tag = match classes {
                     Some(cs) => {
                         let cls = self.classes(Some(cs), env)?;
-                        el(JsxName::Member("__rt".into(), "TypedErrored".into()), vec![("classes".into(), AttrValue::Expr(cls)), fallback], vec![b], false)
+                        attrs.push(("classes".into(), AttrValue::Expr(cls)));
+                        JsxName::Member("__rt".into(), "TypedErrored".into())
                     }
-                    None => el(JsxName::Ident("Errored".into()), vec![fallback], vec![b], false),
-                }
+                    None if region.is_some() => JsxName::Member("__rt".into(), "DevErrored".into()),
+                    None => JsxName::Ident("Errored".into()),
+                };
+                attrs.push(fallback);
+                el(tag, attrs, vec![b], false)
             }
         }))
     }

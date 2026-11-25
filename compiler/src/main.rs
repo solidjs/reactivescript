@@ -27,11 +27,11 @@
 //!                          have no value yet is an error, as its first load would show nothing (08 CN-3d).
 
 use reactivescript::app::{self, read_disk};
-use reactivescript::check::check_modules;
-use reactivescript::emit::{compile_modules, lower_view, Target};
+use reactivescript::check::{check_modules, check_modules_in};
+use reactivescript::emit::{compile_dev, compile_into, lower_view, Target};
 use reactivescript::parse::parse_stmts;
 use reactivescript::project::{project_modules, unverified, PRELUDE};
-use reactivescript::modules::load_modules;
+use reactivescript::modules::{load_modules, load_modules_recovering};
 use reactivescript::serve;
 use reactivescript::signature::print_signature;
 use serde_json::{json, Map, Value};
@@ -40,6 +40,10 @@ use std::io::Read;
 use std::path::Path;
 
 
+/// The cwd, a POSIX path without a trailing `/`: the project root of `rxc model`'s and `rxc app --dev`'s keys.
+fn cwd() -> String {
+    std::env::current_dir().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default()
+}
 fn abs(f: &str) -> String {
     // module keys are POSIX paths (`modules::join_path`), on Windows too
     std::path::absolute(f).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| f.to_string()).replace('\\', "/")
@@ -121,7 +125,9 @@ fn lower_one(r: &Value) -> Value {
     }
     // a handler row that does not parse runs nothing (ref/compile/run.ts)
     let extra: Vec<_> = r["extra"].as_array().map(|xs| xs.iter().map(|x| parse_stmts(x.as_str().unwrap()).unwrap_or_default()).collect()).unwrap_or_default();
-    let out = match compile_modules(&set, &extra) {
+    // dev: each source's and equation's creating calls under its key, the module as the request names it
+    let dev = r["dev"].as_bool().unwrap_or(false).then_some("");
+    let out = match compile_dev(&set, &extra, r["product"].as_bool().unwrap_or(false), dev) {
         Ok(o) => o,
         Err(e) => return json!({ "compileError": e.0 }),
     };
@@ -259,7 +265,7 @@ fn main() {
         "compile" => {
             let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
             let (Some(file), Some(dir)) = (args[1..].iter().find(|a| !a.starts_with("--") && Some(*a) != opt("--out").as_ref() && Some(*a) != opt("--target").as_ref() && Some(*a) != opt("--module-name").as_ref()), opt("--out")) else {
-                eprintln!("usage: rxc compile app.rx --out dir [--target dom|ssr|universal] [--module-name name]");
+                eprintln!("usage: rxc compile app.rx --out dir [--target dom|ssr|universal] [--module-name name] [--dev]");
                 std::process::exit(2);
             };
             let target = match opt("--target").as_deref().unwrap_or("dom") {
@@ -286,7 +292,8 @@ fn main() {
             if !checked.diags.is_empty() {
                 std::process::exit(1);
             }
-            let out = compile_modules(&set, &[]).unwrap_or_else(|e| {
+            let dev = args.iter().any(|a| a == "--dev").then(cwd);
+            let out = compile_into(&set, &[], false, dev.as_deref(), Some(&abs(&dir))).unwrap_or_else(|e| {
                 eprintln!("{}: not compiled: {}", file, e.0);
                 std::process::exit(1);
             });
@@ -310,19 +317,23 @@ fn main() {
         "app" => {
             let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
             let Some(file) = args.get(1) else {
-                eprintln!("usage: rxc app app.rx [--target dom|ssr|universal] [--module-name name]");
+                eprintln!("usage: rxc app app.rx [--target dom|ssr|universal] [--module-name name] [--dev [--root dir]]");
                 std::process::exit(2);
             };
             let target = app::target(opt("--target").as_deref().unwrap_or("dom"));
             let module_name = opt("--module-name").unwrap_or_else(|| "@solidjs/web".into());
-            println!("{}", serde_json::to_string(&app::app(&abs(file), target, &module_name, spa)).unwrap());
+            // --dev: each source's and equation's creating calls under its key, its module relative to --root (the cwd)
+            let dev = args.iter().any(|a| a == "--dev").then(|| opt("--root").map(|r| abs(&r)).unwrap_or_else(cwd));
+            println!("{}", serde_json::to_string(&app::app_dev(&abs(file), target, &module_name, spa, dev.as_deref())).unwrap());
         }
         "check" | "model" => {
             let mut bad = 0;
             let as_json = cmd == "check" && args.iter().any(|a| a == "--json");
             let mut found: Vec<Value> = vec![];
             for f in args[1..].iter().filter(|a| !a.starts_with("--")) {
-                let set = match load_modules(&abs(f), &read_disk) {
+                let entry = abs(f);
+                let loaded = if cmd == "check" { load_modules_recovering(&entry, &read_disk) } else { load_modules(&entry, &read_disk) };
+                let set = match loaded {
                     Ok(s) => s,
                     Err(e) => {
                         bad += 1;
@@ -334,8 +345,20 @@ fn main() {
                         continue;
                     }
                 };
-                let checked = check_modules(&set, spa);
+                for e in &set.parse_errors {
+                    bad += 1;
+                    if as_json {
+                        found.push(parse_error_json(f, e));
+                    } else {
+                        eprintln!("{}", parse_error_text(f, e));
+                    }
+                }
+                // a symbol's key names its module from the cwd, as `file` does
+                let checked = if cmd == "model" { check_modules_in(&set, spa, Some(&cwd())) } else { check_modules(&set, spa) };
                 for d in &checked.diags {
+                    // As in `rx-tsc`, a file with parse errors gets its parse diagnostics,
+                    // not checker diagnostics from its partial tree. Still check other files.
+                    if set.parse_errors.iter().any(|e| e.2 == d.file) { continue; }
                     bad += 1;
                     if as_json {
                         found.push(serve::diagnostic_json(&set, d));
@@ -355,7 +378,7 @@ fn main() {
                         })
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&ms).unwrap());
-                } else if checked.diags.is_empty() && !as_json {
+                } else if checked.diags.is_empty() && set.parse_errors.is_empty() && !as_json {
                     println!("{}: ok", f);
                 }
             }

@@ -48,6 +48,7 @@ pub enum P {
 pub enum Key {
     Ident(String),
     Str(String),
+    Computed(Box<E>),
 }
 
 #[derive(Debug, Clone)]
@@ -110,8 +111,6 @@ pub enum AttrValue {
 #[derive(Debug, Clone)]
 pub enum Child {
     Expr(E),
-    /// raw JSX text (an empty fragment child is written `null`)
-    Text(String),
     Jsx(Jsx),
 }
 
