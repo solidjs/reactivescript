@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Breaking**
+
+- MO-8c: a real `./api` implementation beside the importing module wins over the injected test API, even if
+  `createApp({ api })` is set. A test API call with no injected implementation now throws `MISSING_TEST_API`.
+- `DEAD_TYPED_BOUNDARY` rejects a typed error boundary proven shadowed by an inner catch-all. Put the typed
+  boundary inside the catch-all.
+- `STYLE_SCOPE` rejects a style block outside a supported style scope; move it into the component that owns the view.
+- String and template escapes are cooked in the compiler; programs relying on the previous literal backslashes
+  must escape those backslashes explicitly.
+- Multiline JSX whitespace follows the view whitespace rules (07 §4). Use an explicit `{" "}` where spacing
+  between pieces must survive.
+
 **Changed**
 
 - `catch` follows only an `await`: `await f(x) catch (e) => alt` makes a matching rejection the answer. A `catch` after
@@ -29,6 +41,9 @@
 - `props` in a component declared without props (`component C()`) is `UNBOUND` (RG-4b); it read `undefined`.
 - `guide/async.md`: "One store over the server"; the `GUESS_WHILE_LOADING` advice says what holds when a selection
   changes while a guess is out (05 DV-22).
+
+- `@reactivescript/map` adds static and live app maps, read-only MCP queries, time travel, and dev hot replacement.
+  The latter two have requirements listed in the map package README.
 
 ## 0.3.1
 

@@ -7,7 +7,8 @@
 // last landing, and right after the shell — and every remaining row runs in the browser.
 // node --experimental-strip-types ssr/run.ts [filter]      (default conditions: solid-js resolves to its server build)
 // env: RX_CRATE=1 serves and hydrates the Rust crate's output (compiler/, compile/lowered.ts); CSR=1 also mounts each table in the browser with no server; NO_HYDRATE=1 serves only; SV_SCOPE=1 renders in
-// Solid's server-component scope (DV-9); DEBUG=1, DEBUG_NAMES=a,b and WAIT=ms help when a table disagrees.
+// Solid's server-component scope (DV-9); RX_DEV=1 compiles dev (keys, `DevLoading`/`DevErrored` regions) so a dev client
+// hydrates a non-dev server's output; DEBUG=1, DEBUG_NAMES=a,b and WAIT=ms help when a table disagrees.
 import { SOLID } from "../solid-version.ts";
 import { readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -34,7 +35,7 @@ async function serverFunction(req: import("node:http").IncomingMessage, res: imp
   const chunks: Buffer[] = []; for await (const c of req) chunks.push(c as Buffer);
   const headers = new Headers(); for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string") headers.set(k, v);
   const request = new Request(`http://127.0.0.1${req.url}`, { method: req.method, headers, body: req.method === "GET" || req.method === "HEAD" ? undefined : Buffer.concat(chunks) });
-  const rpc = createApp(); rpcApps.push(rpc); (globalThis as { __rx_app?: unknown }).__rx_app = rpc;
+  const rpc = createApp({ scenarioFlights: true }); rpcApps.push(rpc); (globalThis as { __rx_app?: unknown }).__rx_app = rpc;
   const response = await handleServerFunctionRequest(request);
   res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
   if (response.body) for await (const c of response.body as unknown as AsyncIterable<Uint8Array>) res.write(c);
@@ -56,7 +57,14 @@ await new Promise<void>(r => http.listen(0, "127.0.0.1", () => r()));
 const port = (http.address() as { port: number }).port;
 const browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: process.env.CHROMIUM } : {});   // CHROMIUM: a system browser (as eval/harness/driver.mjs)
 const page = await browser.newPage();
-const pageErrors: string[] = []; page.on("pageerror", (e: Error) => pageErrors.push(e.message)); page.on("console", (m: any) => { if (m.type() === "error" || (m.type() === "warning" && /hydrat/i.test(m.text()))) pageErrors.push(m.text()); });
+const pageErrors: string[] = []; page.on("pageerror", (e: Error) => pageErrors.push(e.message));
+page.on("console", (m: any) => {
+  // Solid transports a thrown server function result with HTTP 500. The scenario
+  // checks the error seen by RX, not Chromium's network status diagnostic.
+  if (m.location().url.startsWith(`http://127.0.0.1:${port}/_server/`) &&
+      /^Failed to load resource: the server responded with a status of 500\b/.test(m.text())) return;
+  if (m.type() === "error" || (m.type() === "warning" && /hydrat/i.test(m.text()))) pageErrors.push(m.text());
+});
 const textOf = () => page.evaluate(() => {
   const root = document.getElementById("app"); if (!root) return "";
   let s = ""; const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, { acceptNode: n => { for (let p = n.parentElement; p && p !== root; p = p.parentElement) if (p.tagName === "SCRIPT" || p.tagName === "TEMPLATE" || p.tagName === "STYLE") return NodeFilter.FILTER_REJECT; return NodeFilter.FILTER_ACCEPT; } });
@@ -81,7 +89,7 @@ async function serve(sc: Scenario, src: string, rows: Row[], title: string, line
   const dir = `${outDir}${sc.name}.${++seq}/`; mkdirSync(dir, { recursive: true });
   for (const [name, js] of out.views("ssr")) writeFileSync(dir + name, directives(js, dir + name, "server"));
   const main = (await import(pathToFileURL(dir + out.entry).href)).default;
-  const app = createApp();
+  const app = createApp({ scenarioFlights: true });
   const got: string[] = []; let ended = false; let chunks = 0; let renderError: unknown = null;
   const doc: string[] = [];
   const served$ = new Promise<void>(resolve => {
@@ -94,7 +102,7 @@ async function serve(sc: Scenario, src: string, rows: Row[], title: string, line
     };
   });
   // SV-4: another request for the same page, in flight at the same time — its own app, its own module state
-  if (other) { const b = createApp(); b.stream(main(b), { write: (c: string) => { other.chunks.push(c); }, end: () => {} }); }
+  if (other) { const b = createApp({ scenarioFlights: true }); b.stream(main(b), { write: (c: string) => { other.chunks.push(c); }, end: () => {} }); }
   const nav = page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "commit" }).catch(() => {});
   await served$; await nav;
   for (let i = 0; i < 40 && chunks === 0 && !ended && !renderError; i++) await wait(10);
@@ -122,7 +130,7 @@ const rtWeb = fileURLToPath(new URL("../compile/rt-web.ts", import.meta.url));
 function bundle(dir: string, views: Map<string, string>, entry: string) {
   const cdir = dir + "client/"; mkdirSync(cdir, { recursive: true });
   for (const [name, js] of views) writeFileSync(cdir + name, directives(js, dir + name, "client"));   // the server's filename: the same ids
-  writeFileSync(cdir + "client-entry.mjs", `import main from "./${entry}";\nimport { createApp, flush } from ${JSON.stringify(rtWeb)};\nimport { sharedConfig } from "solid-js";\nconst app = createApp({ root: document.getElementById("app") });\nwindow.__client = { app, flush, sharedConfig, main };\n`);
+  writeFileSync(cdir + "client-entry.mjs", `import main from "./${entry}";\nimport { createApp, flush } from ${JSON.stringify(rtWeb)};\nimport { sharedConfig } from "solid-js";\nconst app = createApp({ root: document.getElementById("app"), scenarioFlights: true });\nwindow.__client = { app, flush, sharedConfig, main };\n`);
   // the dev builds: Solid reports a hydration key miss, a tag mismatch and unclaimed server nodes on the console
   const r = buildSync({ entryPoints: [cdir + "client-entry.mjs"], bundle: true, write: false, format: "esm", platform: "browser", conditions: ["browser", "development"], logLevel: "silent", tsconfigRaw: "{}" });   // (not next's tsconfig paths, which map solid-js to its source)
   return r.outputFiles[0].text;
@@ -146,10 +154,13 @@ async function hydrated(sc: Scenario, t: Scenario["tables"][number], src: string
   try { const set = moduleSet(sc, src); if (checkModules(set).diags.length) return true; out = build(sc, src, chains.flat().filter(r => r.action.startsWith("handler")).map(r => r.action.slice(7))); }
   catch (e) { if (e instanceof CompileError) return true; lines.push(`  ✗ ${t.title} [${label}]: ${(e as Error).message}`); return false; }
   const dir = `${outDir}${sc.name}.${++seq}/`; mkdirSync(dir, { recursive: true });
-  for (const [name, js] of out.views("ssr")) writeFileSync(dir + name, directives(js, dir + name, "server"));
+  const serverViews = out.views("ssr");
+  const hasRpc = [...serverViews.values()].some(js => js.includes('"use server"'));
+  for (const [name, js] of serverViews) writeFileSync(dir + name, directives(js, dir + name, "server"));
   const main = (await import(pathToFileURL(dir + out.entry).href)).default;
   clientJs = bundle(dir, out.views("dom"), out.entry);
-  const app = createApp(); let ended = false; let chunks = 0;
+  const rpcBefore = rpcApps.length;
+  const app = createApp({ scenarioFlights: true }); let ended = false; let chunks = 0;
   const csr = at === 0;   // the baseline: the same bundle mounted on an empty page, no server
   const served$ = new Promise<void>(resolve => {
     pending = res => {
@@ -186,14 +197,21 @@ async function hydrated(sc: Scenario, t: Scenario["tables"][number], src: string
       if (process.env.DEBUG) console.log("land on server:", r.action, await page.evaluate(() => JSON.stringify([...(window as any).__client.app.flights.keys()])));
     }
     const key = named ?? app.lastKey.get(m[2]);
-    const owner = key === undefined ? undefined : [app, ...[...rpcApps].reverse()].find(a => a.flights.has(key));   // the page's request, or a server function's
+    const ownerOf = () => key === undefined ? undefined : [app, ...rpcApps.slice(rpcBefore).reverse()].find(a => a.flights.has(key));
+    let owner = ownerOf();   // the page's request, or a server function's
+    if (!server && hasRpc && named !== null && !owner) {
+      // The previous browser row may have dispatched a request whose body
+      // hasn't reached the scenario flight yet.
+      const deadline = Date.now() + 2000;
+      while (!owner && Date.now() < deadline) { await wait(15); owner = ownerOf(); }
+    }
     const f = owner?.flights.get(key!);
     if (!f) return false;
     const value = new Function("__rt", "__B", `return ${js};`)(owner, owner!.B);
     if (m[1] === "reject") f.reject(value instanceof Error ? value : new Error(String(value))); else f.resolve(value);
     return true;
   };
-  let ok = true; const shown: string[] = []; const mark = lines.length; const rpcBefore = rpcApps.length;
+  let ok = true; const shown: string[] = []; const mark = lines.length;
   for (let i = 0; i <= chains.length; i++) {   // (i === chains.length: hydrating after the last row)
     const c = chains[i] ?? []; const r = c[0];
     if (i === at && chunks === 0 && at < served) at++;   // nothing has arrived to take over yet (a held shell, SV-1c): the client loads with the shell
@@ -245,8 +263,19 @@ async function hydrated(sc: Scenario, t: Scenario["tables"][number], src: string
     await wait(Number(process.env.WAIT ?? 60));
     await page.evaluate(() => { (window as any).__client.flush(); });
     if (process.env.DEBUG_NAMES) console.log("  after", r.instant, "ended=" + ended, await page.evaluate(() => { const sc = (window as any).__client.sharedConfig; return `done=${sc.done} hydrating=${sc.hydrating} HYdone=${(window as any)._$HY.done}`; }), await page.evaluate((names: string[]) => names.map(n => { try { return n + "=" + (window as any).__client.app.fmt((window as any).__client.app.dget(n)); } catch (e) { return n + "!" + (e as Error).message; } }).join(" "), process.env.DEBUG_NAMES.split(",")));
-    const got = norm(await textOf()); const last = c[c.length - 1];
-    const k = known(last); if (k && got === norm(k.frame)) { lines.push(`  ${k.ruled ? "✓" : "≠"} ${t.title} [${label}] instant ${last.instant}: ${got}  — ${k.ruled ? "SV-3b hydration window" : "recorded (hydrated)"}`); break; }
+    let got = norm(await textOf()); const last = c[c.length - 1];
+    const k = known(last);
+    if (hasRpc) {
+      // Flushing Solid doesn't wait for a fetch response or its continuation.
+      // Let that row reach its frame before driving the next row.
+      const deadline = Date.now() + 2000;
+      while (!matches(last, got) && !(k && got === norm(k.frame)) && Date.now() < deadline) {
+        await wait(15);
+        await page.evaluate(() => { (window as any).__client.flush(); });
+        got = norm(await textOf());
+      }
+    }
+    if (k && got === norm(k.frame)) { lines.push(`  ${k.ruled ? "✓" : "≠"} ${t.title} [${label}] instant ${last.instant}: ${got}  — ${k.ruled ? "SV-3b hydration window" : "recorded (hydrated)"}`); break; }
     if (!matches(last, got)) { ok = false; lines.push(`  ✗ ${t.title} [${label}] instant ${last.instant}: expected '${framesOf(last).join("' or '")}', got '${got}'${pageErrors.length ? `  (page: ${pageErrors.join(" | ")})` : ""}`); break; }
     shown.push(got);
   }
@@ -331,7 +360,7 @@ async function runBeforeHydration(sc: Scenario, lines: string[]): Promise<boolea
   for (const [name, js] of out.views("ssr")) writeFileSync(dir + name, directives(js, dir + name, "server"));
   const main = (await import(pathToFileURL(dir + out.entry).href)).default;
   clientJs = bundle(dir, out.views("dom"), out.entry);
-  const app = createApp(); let chunks = 0;
+  const app = createApp({ scenarioFlights: true }); let chunks = 0;
   const served$ = new Promise<void>(resolve => {
     pending = res => {
       res.on("error", () => {});

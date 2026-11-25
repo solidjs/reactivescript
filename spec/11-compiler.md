@@ -148,17 +148,21 @@ record argued each way; this is the decision.
   | `show(v)`, `scopedClass(v, hash)` | `{e}` (a value formatted, a view inserted), a dynamic class with the view's scope (CSS-2) | — |
   | `TypedErrored`, `Portal` | `errored fallback(e: A)` (R-f-4), `portal` (RG-8) | `Errored`, `Portal` |
   | `B` | the language's built-in functions (`len`, `str`, `map`, `filter`, `sum`, `every`, `indexOf`) and `log` | — |
+  | `key(k, f)` | dev builds only: a source's or an equation's creating calls, `__rt.key("<key>", () => …)`, its key CP-6f's (decision 11) | the `name` option, `rx:` + key, on each node a helper creates under it; the server build, and Solid's production build, run `f()` alone |
 
   The app itself: `mount(view, hydrating)` in the client build, `stream(view,
   sink)` in the server's.
 - **CP-4c (The harness's, not the package's).** `reg`, `lookup`, `dget`,
   `dset` (a scenario's `handler` rows reach any live binding by name),
-  `api` and `jsError` (`./api` and its declared errors as test flights,
-  where a program imports the real module), `B.fetch` and `B.fail` (the
+  `api` and `jsError` (the unresolved `./api` test API and its declared
+  errors, MO-8c), `B.fetch` and `B.fail` (the
   scenario prelude), and `flights`, `lastKey`, `log`, `asyncError`,
   `frame` (what the runners observe). Compiled code calls them only in a
   conformance build — the compiler's option for running `scenarios/`
-  (CP-5); `ref/compile/emit.ts` always emits one.
+  (CP-5); `ref/compile/emit.ts` always emits one. The unresolved `./api`
+  fallback also serves the example apps with `createApp({ api })`.
+  Outside the flight-driving runners, `__rt.api(name)` without an injected
+  API throws `MISSING_TEST_API` at binding rather than making a test flight.
 
 ## CP-5 — `ref/` is the conformance suite
 
@@ -209,6 +213,15 @@ spellings again. Compile-time only; nothing of it reaches run time.
 - **CP-6e (not a format).** No one outside the crate depends on it: it is
   not a stable IR and not a commitment to a second front end (issue #1).
   Ids are indices within one module's model.
+- **CP-6f (keys).** Each source and equation symbol carries a `key`,
+  `<module>|<scope>|<name>[#n]`: the module's POSIX path relative to the
+  project root (Vite's `root`, the cwd for `rxc`), the enclosing
+  component's name (empty at module level), the name, and `#n` on the
+  n+1th declaration of that scope and name in the module, in source order
+  (two `if` branches). `ref/src/model.ts` `declKeys` and `model.rs`
+  `decl_keys` compute it from the AST, and `ref/crate.ts` diffs it with the
+  rest of the model. A dev build names the declaration's Solid nodes by it
+  (CP-4b `key`, decision 11).
 
 ## CP-7 — The crate today
 
@@ -291,7 +304,11 @@ TY-1c), so every position has to cross between `.rx` and the projection.
   0-based columns in UTF-16 code units (LSP's), and byte offsets. The
   checker is line-precise (CN-1a), so a diagnostic's range is its line's:
   from the first node that starts on it to the furthest any such node
-  reaches on it (decision 9).
+  reaches on it (decision 9). `rxc check` uses the recovering source
+  parse (CP-8e) and reports a batch across the module graph: a source
+  with parse errors reports those, while other sources report their
+  checker diagnostics. It does not run TypeScript; use `rx-tsc` for
+  the projection's type errors (TY-1a).
 - **CP-8e (the editor).** An editor's parse recovers: a declaration that
   does not parse is a parse error on its line and is skipped to the next
   line that starts at column 0, and a missing expression is an empty name,
@@ -372,3 +389,36 @@ TY-1c), so every position has to cross between `.rx` and the projection.
    of decision 7 would serve the same requests, but one binary per
    platform; this build answers only `serve.rs`'s requests, so it is not
    decision 7's missing WebAssembly fallback for compiling.
+11. **Dev builds name nodes by key** (CP-4b `key`, CP-6f, 2026-11-24,
+   taken by default — veto here). With the dev flag (`rxc app --dev`,
+   `rxc compile --dev`, the Node-API `app(…, dev, root)`, and Vite's dev
+   client), each source's and equation's creating calls, its hoisted
+   awaits and catches included, run under `__rt.key`, and the client
+   runtime names every Solid node it creates there `rx:` + key, so the
+   devtools can tie a node to its declaration. Without the flag the output
+   is byte for byte what it was. In a dev build Vite also registers the
+   program's map (`@reactivescript/map/live`) from its entry when the
+   project has `@reactivescript/map`. A declared JS primitive's instance
+   (MO-10) is not keyed: its nodes are the library's.
+
+12. **Dev-only keyed replacement** (taken by default — veto here).
+   With Vite HMR on, a save checks the affected RX program and compares its
+   old and new graphs. The optional map observes the plan, but is not
+   required. The compiled entry is a stable app-factory boundary:
+   Solid replaces its rendered scope without reloading its JS importer or
+   the page. It recreates declarations using the new code. Live source
+   values are carried by key (or a recognized move), not by declaration
+   order, within one app. The runtime skips a carried initializer; a reset
+   starts fresh. Only the primary source accessor supplies a seed, not its
+   hoisted awaits/catches. An edited standing question uses its carried
+   answer as its loading value while it asks again. Repeated instances pair
+   in mount order at a stable, unambiguous render site. Ambiguous, held or
+   unavailable source instances are reported as uncarried. Unchanged
+   dependency modules keep their live owners and are not reinitialized.
+   A failed replacement of the whole boundary may reload; waiting for a
+   travel landing is bounded.
+   The host records replacement as a flush. Travel uses the current code
+   and reports historical values it cannot reproduce exactly. None of this
+   changes production lowering or adds a production runtime dependency.
+   The runtime's development export contains the instrumentation and the
+   reference harness API; production exports leave them out.

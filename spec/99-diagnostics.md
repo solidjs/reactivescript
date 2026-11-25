@@ -57,6 +57,7 @@ Bins:
 | `FALLBACK_FLASH`                  | R   | timing                                                             |
 | `STACKED_HOLDS`                   | R   | timing                                                             |
 | `ABANDONED_FLIGHTS`               | R   | timing                                                             |
+| `MISSING_TEST_API`                | R   | CP-4c / MO-8c: unresolved `./api` test import without an injected API outside the scenario runners |
 | `UNTRACKED_ASYNC_HANDLER`         | R   | timing; the structural half (no write before `await`, no `action`) is S |
 | `HOT_SCOPE_*`                     | R   | profiling                                                          |
 | `WASTED_RECOMPUTE`                | R   | data-dependent                                                     |
@@ -90,6 +91,7 @@ named.
 | `PRE_OF_NON_REACTIVE`             | S   | C-2   | S-check-1 |
 | `UNBOUND`                         | S   | lexical scope (a component sees its declaration site, RG-7a; `props` of a component that declares none, RG-4b) | S-check-1 |
 | `ARGUMENT_COUNT` (new)            | S   | AC-1f: a call of a declared action with another number of arguments than its parameters | S-check-1 |
+| `ACTION_PARAMETER_DEFAULT`       | S   | AC-1f: an action parameter has a default; pass the value at the call instead | S-check-1 |
 | `UNKNOWN_COMPONENT`, `COMPONENT_AS_VALUE` | S | RG-4a | S-check-1, S-region-5 |
 | `INSTANTIATION_NOT_BOUND`         | S   | E-9 / RG-6 | S-region-6 |
 | `SNAPSHOT_ARGUMENT`               | S   | E-10  | S-region-6 |
@@ -116,13 +118,15 @@ named.
 | `ROW_NARROWER_THAN_INFERRED`      | S   | CN-4a (checked only where a row is written); R-f-9 for `fails(…)` | S-check-1, S-fail-1 |
 | `EFFECT_WRITES_OWN_SOURCE`        | S   | C-3 (directly or through equations; not closures the apply creates) | S-check-2 |
 | `UNHANDLED_FAILURE`               | S   | R-f-5 / CN-6a (over the static application tree; props where read, children where rendered) | S-fail-1, S-fail-2 |
+| `DEAD_TYPED_BOUNDARY`             | S   | R-f-4: a typed `errored (e: X)` whose children an inner catch-all wraps, so `X` never reaches it | S-fail-5 |
 | `CATCH_NOT_ON_AWAIT` (new)        | S   | R-f-4: a `catch` after anything but an `await` (a failed value is shown by an `errored` region where it is read; 2026-11-19) | S-fail-1, S-catch-snapshot |
 | `UNCAUGHT_ACTION_FAILURE`         | S   | R-f-6 / CN-6a (incl. a prop the action reads, checked at each application) | S-action-1, S-fail-2 |
 | `NOT_AN_ERROR_CLASS`              | S   | R-f-1 | S-fail-1 |
 | `WRITE_TO_NON_SOURCE` (MO-2)      | S   | MO-2a: an imported source is read-only | S-module-1 |
 | `IMPORT_ROW_MISMATCH`             | S   | MO-4a: `pure` / `fails` on an `.rx` import | S-module-1 |
 | `MODULE_CYCLE`                    | S   | MO-5  | S-module-1 |
-| `NOT_EXPORTED`, `MODULE_NOT_FOUND` | S  | MO-6a | S-module-1 |
+| `NOT_EXPORTED`, `MODULE_NOT_FOUND` | S  | MO-6a; MO-8e for a type import in a `.d.rx` | S-module-1, S-module-6 |
+| `TYPE_IMPORT`                     | S   | MO-8e: a `.d.rx` imported a value, not a type | S-module-6 |
 | `NOT_A_CONTEXT`, `CONTEXT_AS_VALUE` | S | RG-7a | S-context-1 |
 | `SOURCE_CONTEXT`, `WRITE_TO_NON_SOURCE` (O-4) | S | O-4: a context is read beneath its provision; `context x: source T` withdrawn (RG-7c, 2026-10-31) | S-context-1 |
 | `ROW_NARROWER_THAN_INFERRED` (RG-7e) | S | a provision wider than its context's declared rows | S-context-1 |
@@ -132,6 +136,7 @@ named.
 | `CLIENT_QUESTION_UNHELD`          | S   | 10 SV-7b: a client question's reader with no `loading` above it on some path (Solid: `ASYNC_OUTSIDE_LOADING_BOUNDARY`, at run time) | S-server-3 |
 | `CLIENT_NOT_AWAITED`              | S   | 12 SF-5b | S-server-3 |
 | `STYLE_PLACEMENT`                 | S   | 07 CSS-1: a `<style>` off its view's top level, or a second one | S-surface-2 |
+| `STYLE_SCOPE`                     | S   | 07 CSS-2: a `<style>` class matches an element of another component in the file, which is its own view | S-surface-2 |
 | `UNTIL_PREDICATE`                 | S   | 06 AC-6: `until`'s argument is not a predicate `() => e` | S-action-2 |
 | `HOOK_CALLBACK` (new)             | S   | 02 EF-7, EF-8: `onSettled`'s or `onFlush`'s argument is not a closure `() => { … }` | S-flush-1 |
 | `SETTLED_CLEANUP_UNOWNED`, `IO_IN_REACTIVE` (EF-7, EF-8) | S | an `onSettled` callback returning a cleanup; either hook called in reactive scope | S-settled-1, S-flush-1 |

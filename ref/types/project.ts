@@ -97,7 +97,7 @@ export function projectModules(set: ModuleSet): Projected[] {
     out.push({ path: projectedPath(path), code: w.out.join("\n"), lines: w.lines, rx: path });
   }
   for (const [rx, sig] of set.signatures ?? []) out.push({ path: `${rx}.d.ts`, code: signatureStub(sig), lines: [], rx: rx.replace(/\.rx$/, ".d.rx") });   // TY-4c
-  for (const [dts, decls] of set.declarations ?? []) out.push({ path: dts.replace(/\.d\.rx$/, ".d.ts"), code: declarationFile(decls), lines: [], rx: dts });
+  for (const [dts, decls] of set.declarations ?? []) out.push({ path: dts.replace(/\.d\.rx$/, ".d.ts"), code: declarationModule(dts, decls, set), lines: [], rx: dts });
   for (const [mod, names] of jsStubs) out.push({ path: mod, code: [...names].map(n => n === "default" ? "declare const __d: any; export default __d;" : `export declare const ${n}: any;`).join("\n"), lines: [], rx: mod });
   return out;
 }
@@ -107,20 +107,71 @@ export function projectModules(set: ModuleSet): Projected[] {
 function signatureStub(sig: ModSig): string {
   return [...sig.exports].map(([n, x]) => x.kind === "type" ? `export type ${n} = any;` : x.kind === "comp" ? `export declare function ${n}(props: any): any;` : `export declare const ${n}: any;`).join("\n");
 }
-/** MO-8: a `.d.rx` as TypeScript's `.d.ts` for the same JS module. */
+/** The namespace a `.d.rx` is declared as. Same spelling as `compiler/src/project.rs` `ns_name`. */
+const nsName = (path: string) => "__D_" + path.replace(/[^A-Za-z0-9_]/g, "_");
+/** A module-level alias of an imported type, so a declare namespace can name it without importing the sibling `.ts`. */
+const bridgeName = (path: string, name: string) => "__T_" + path.replace(/[^A-Za-z0-9_]/g, "_") + "_" + name;
+/** A path from `fromFile`'s directory to `toFile`, for an `import type` of an `.rx` projection. */
+function relModule(fromFile: string, toFile: string): string {
+  const from = fromFile.split("/").slice(0, -1);
+  const to = toFile.split("/");
+  let i = 0;
+  while (i < from.length && i + 1 < to.length && from[i] === to[i]) i++;
+  const rel = "../".repeat(from.length - i) + to.slice(i).join("/");
+  return rel.startsWith(".") ? rel : "./" + rel;
+}
+/** MO-8: a `.d.rx` as TypeScript's `.d.ts` for the same JS module. An import is a local alias of its bridge (MO-8e). */
 function declarationFile(decls: JsDecl[]): string {
   return decls.map(d => {
-    if (d.kind === "type") return `export ${d.text ?? `type ${d.name} = any`}`;
+    if (d.kind === "import") return d.names.map(n => `type ${n.alias} = ${d.target ? bridgeName(d.target, n.name) : "any"};`).join("\n");
+    if (d.kind === "type") return `${d.exported ? "export " : ""}${d.text ?? `type ${d.name} = any`}`;
     if (d.kind === "error") return `export declare class ${d.name}$ extends Error {}\nexport declare const ${d.name}: (message?: string) => ${d.name}$;\nexport type ${d.name} = ${d.name}$;`;
     const ps = d.params.map((n, i) => `${n}${d.ptypes?.[i] ? `: ${d.ptypes[i]}` : ""}`).join(", ");
-    return `export declare function ${d.name}(${ps}): ${d.ret ?? "any"};`;
+    return `export declare function ${d.name}${d.generics ?? ""}(${ps}): ${d.ret ?? "any"};`;
   }).join("\n") + "\n";
+}
+function nsBlock(dts: string, decls: JsDecl[]): string {
+  const body = declarationFile(decls).trimEnd().replace(/export declare /g, "export ").split("\n").map(l => `  ${l}`).join("\n");
+  return `declare namespace ${nsName(dts)} {\n${body}\n}`;
+}
+/** Dependency namespaces and the bridges this file's type imports name. `seen` holds `.d.rx` paths already emitted. */
+function declPreamble(decls: JsDecl[], set: ModuleSet, fromFile: string, seen: Set<string>, bridged: Set<string>): string {
+  let out = "";
+  for (const d of decls) {
+    if (d.kind !== "import" || !d.target) continue;
+    if (!d.rx) out += depText(d.target, set, fromFile, seen, bridged);
+    for (const n of d.names) {
+      const b = bridgeName(d.target, n.name);
+      if (bridged.has(b)) continue;
+      bridged.add(b);
+      out += d.rx ? `import type { ${n.name} as ${b} } from ${JSON.stringify(relModule(fromFile, d.target))};\n` : `type ${b} = ${nsName(d.target)}.${n.name};\n`;
+    }
+  }
+  return out;
+}
+function depText(target: string, set: ModuleSet, fromFile: string, seen: Set<string>, bridged: Set<string>): string {
+  if (seen.has(target)) return "";
+  seen.add(target);
+  const decls = set.declarations?.get(target);
+  if (!decls) return "";
+  return declPreamble(decls, set, fromFile, seen, bridged) + nsBlock(target, decls) + "\n";
+}
+/** The standalone `.d.ts`: a file with no type import is `declarationFile`, unchanged. */
+function declarationModule(dts: string, decls: JsDecl[], set: ModuleSet): string {
+  if (!decls.some(d => d.kind === "import")) return declarationFile(decls);
+  const seen = new Set([dts]);
+  return declPreamble(decls, set, dts, seen, new Set()) + declarationFile(decls);
 }
 
 class Proj {
   w: W; set: ModuleSet; path: string; jsStubs: Map<string, Set<string>>;
   private used = new Set<string>();                         // prelude names the module reads
   private declared = new Set<string>();                     // names the module declares (they shadow the prelude)
+  private slots = new Set<string>();                        // sources and equations: a write checks this type, not a branch's narrowing (TY-2)
+  private snap = new Set<string>();                         // a handler read is a fresh snapshot of this name's type (TY-2)
+  private rename: Map<string, string> | null = null;       // inside a handler, a snap name reads as its snapshot binding
+  private ambients = new Set<string>();                    // a JS module's `.d.rx`, emitted once as the types the import is checked against (TY-4b)
+  private bridged = new Set<string>();                     // MO-8e: a type bridge already emitted in this projection
   constructor(w: W, set: ModuleSet, path: string, jsStubs: Map<string, Set<string>>) { this.w = w; this.set = set; this.path = path; this.jsStubs = jsStubs; }
 
   module(p: Program) {
@@ -142,6 +193,7 @@ class Proj {
   decls(ds: Decl[], ind: string, top = false) {
     const ex = (d: Decl) => top && (d as { exported?: boolean }).exported ? "export " : "";
     for (const d of ds) if ("name" in d) this.declared.add(d.name);
+    for (const d of ds) if (d.k === "source" || d.k === "eq") { this.slots.add(d.name); this.snap.add(d.name); }   // before actions, whose writes name them
     for (const d of ds) {
       if (d.k === "import") this.importDecl(d, ind);
       if (d.k === "typedecl") this.w.emit(`${ind}${ex(d)}${d.text ?? `type ${d.name} = any;`}`, d.line);
@@ -170,8 +222,8 @@ class Proj {
       }
     }
     for (const d of this.order(ds)) {
-      if (d.k === "source") this.w.emit(`${ind}${ex(d)}const ${d.name}${ann(d.type)} = ${typeText(d.type) ? `__.typed<${typeText(d.type)}>(${this.expr(d.init, false)})` : `__.src(${this.expr(d.init, false)})`};`, d.line);
-      if (d.k === "eq") this.w.emit(`${ind}${ex(d)}const ${d.name}${ann(d.type)} = __.eq(${this.expr(d.e, false, d.name)}, true);`, d.line);   // R-1: no promise without `await`
+      if (d.k === "source") { this.w.emit(`${ind}${ex(d)}const ${d.name}${ann(d.type)} = ${typeText(d.type) ? `__.typed<${typeText(d.type)}>(${this.expr(d.init, false)})` : `__.src(${this.expr(d.init, false)})`};`, d.line); this.w.emit(`${ind}type __W_${d.name} = typeof ${d.name};`, d.line); }
+      if (d.k === "eq") { this.w.emit(`${ind}${ex(d)}const ${d.name}${ann(d.type)} = __.eq(${this.expr(d.e, false, d.name)}, true);`, d.line); this.w.emit(`${ind}type __W_${d.name} = typeof ${d.name};`, d.line); }   // R-1: no promise without `await`
       if (d.k === "provide") this.w.emit(`${ind}__.provide(${d.name}, ${this.expr(d.e, false)});`, d.line);
     }
     for (const d of ds) if (d.k === "effect") {
@@ -183,18 +235,85 @@ class Proj {
   private importDecl(d: Extract<Decl, { k: "import" }>, ind: string) {
     const names = d.names.map(n => n.name === "default" ? null : n.name === n.alias ? n.name : `${n.name} as ${n.alias}`).filter(Boolean);
     const dflt = d.names.find(n => n.name === "default")?.alias;
-    for (const n of d.names) if (BUILTINS.has(n.name)) this.declared.delete(n.alias);   // the prelude's own (`import { log } from "./prelude"`)
-    const prelude = d.names.filter(n => BUILTINS.has(n.name));
+    const isPrelude = (n: string) => d.from === "./prelude" && BUILTINS.has(n);
+    for (const n of d.names) if (isPrelude(n.name)) this.declared.delete(n.alias); else this.declared.add(n.alias);
+    const prelude = d.names.filter(n => isPrelude(n.name));
     if (prelude.length) { for (const n of prelude) this.used.add(n.name); }
-    const rest = d.names.filter(n => !BUILTINS.has(n.name)); if (!rest.length) return;
+    const rest = d.names.filter(n => !isPrelude(n.name)); if (!rest.length) return;
     let from = d.from;
     if (!d.resolved && !d.declared) {                                                        // a JS module with no declaration: `any`
       const key = this.modPath(d.from) + ".ts"; let s = this.jsStubs.get(key); if (!s) this.jsStubs.set(key, (s = new Set())); for (const n of rest) s.add(n.name); from = d.from;
     }
     void names; void dflt;
+    const decls = d.declared ? this.set.declarations?.get(d.declared) : undefined;
+    if (decls) { this.declaredImport(d, rest, decls, ind); return; }   // TY-4b: the `.d.rx` is the type, even where a `.ts` sits beside it
     const parts = rest.filter(n => n.name !== "default").map(n => n.name === n.alias ? n.name : `${n.name} as ${n.alias}`);
     const def = rest.find(n => n.name === "default")?.alias;
     this.w.emit(`${ind}import ${def ? def + (parts.length ? ", " : "") : ""}${parts.length ? `{ ${parts.join(", ")} }` : ""} from "${from}";`, d.line);
+    for (const n of rest) if (!this.isTypeImport(d, n.name)) this.snapAlias(n.alias, ind, d.line);
+  }
+  /** A type export binds no value (MO-6c); `typeof` it is not a snapshot. */
+  private isTypeImport(d: Extract<Decl, { k: "import" }>, name: string): boolean {
+    if (!d.resolved) return false;
+    if (this.set.programs.get(d.resolved)?.decls.some(x => x.k === "typedecl" && x.name === name)) return true;
+    return this.set.signatures?.get(d.resolved)?.exports.get(name)?.kind === "type";
+  }
+  /** Snap names a handler reads, not counting its parameters, its locals, or a nested arrow (that one snapshots itself). Sorted, so both projections agree. */
+  private handlerSnaps(fn: Extract<Expr, { k: "fn" }>): string[] {
+    const bound = new Set(fn.params);
+    const out = new Set<string>();
+    const expr = (e: Expr) => {
+      if (!e?.k) return;
+      if (e.k === "fn" || e.k === "serverfn" || e.k === "draft") return;
+      if (e.k === "id") { if (this.snap.has(e.name) && !bound.has(e.name)) out.add(e.name); return; }
+      for (const v of Object.values(e)) {
+        if (Array.isArray(v)) { for (const x of v) if (x && typeof x === "object") { if ("k" in x) expr(x as Expr); else if ("v" in x) expr((x as { v: Expr }).v); else if ("spread" in x) expr((x as { spread: Expr }).spread); } }
+        else if (v && typeof v === "object" && "k" in v) expr(v as Expr);
+      }
+    };
+    const stmts = (ss: Stmt[]) => {
+      for (const s of ss) {
+        if (s.k === "let") { expr(s.e); bound.add(s.name); continue; }
+        if (s.k === "write" || s.k === "optimistic") { for (const p of s.target.path) if (typeof p !== "string") expr(p); expr(s.e); continue; }
+        if (s.k === "sif") { expr(s.c); stmts(s.t); stmts(s.f); continue; }
+        if (s.k === "try") { stmts(s.body); if (s.handler) stmts(s.handler); if (s.fin) stmts(s.fin); continue; }
+        if (s.k === "action") { stmts(s.body); continue; }
+        if (s.k === "throw" || s.k === "expr") expr(s.k === "throw" ? s.e : s.e);
+        if (s.k === "return" && s.e) expr(s.e);
+      }
+    };
+    if (fn.stmts) stmts(fn.stmts); else expr(fn.body);
+    return [...out].sort();
+  }
+  /** A handler's read of this name is a snapshot of its type, not a branch's narrowing (TY-2). */
+  private snapAlias(alias: string, ind: string, line: number) {
+    this.snap.add(alias);
+    this.w.emit(`${ind}type __W_${alias} = typeof ${alias};`, line);
+  }
+  /** TY-4b: check the import against its `.d.rx`, not whatever TypeScript would resolve the JS module to. */
+  private declaredImport(d: Extract<Decl, { k: "import" }>, rest: { name: string; alias: string }[], decls: JsDecl[], ind: string) {
+    const ns = nsName(d.declared!);   // a declare namespace, not a module: nothing for TypeScript to resolve beside the `.ts`
+    const first = !this.ambients.has(d.declared!);
+    if (first) this.ambients.add(d.declared!);
+    if (first) {
+      const pre = decls.some(x => x.kind === "import") ? declPreamble(decls, this.set, this.path, this.ambients, this.bridged) : "";
+      const body = declarationFile(decls).trimEnd().replace(/export declare /g, "export ").split("\n").map(l => `  ${l}`).join("\n");
+      const block = `${ind}declare namespace ${ns} {\n${body}\n${ind}}`;
+      this.w.emit(pre ? pre.replace(/\n$/, "") + "\n" + block : block, d.line);
+    }
+    const of = (n: string) => decls.find(x => x.kind !== "import" && x.name === n);
+    const values = rest.filter(n => of(n.name)?.kind !== "type");
+    if (values.length) {
+      const parts = values.filter(n => n.name !== "default").map(n => `${n.name} as __js_${n.alias}`);
+      const def = values.find(n => n.name === "default");
+      this.w.emit(`${ind}import ${def ? `__js_${def.alias}` + (parts.length ? ", " : "") : ""}${parts.length ? `{ ${parts.join(", ")} }` : ""} from ${J(d.from)};`, d.line);
+    }
+    for (const n of rest) {
+      const x = of(n.name);
+      if (!x || x.kind === "type") this.w.emit(`${ind}type ${n.alias} = ${ns}.${n.name};`, d.line);
+      else { this.w.emit(`${ind}const ${n.alias} = __js_${n.alias} as typeof ${ns}.${n.name};`, d.line); this.snapAlias(n.alias, ind, d.line); }
+      if (x?.kind === "error") this.w.emit(`${ind}type ${n.alias} = ${ns}.${n.name};`, d.line);
+    }
   }
   /** A JS import's module, from the program's root (where the stubs are written). */
   private modPath(from: string) { const base = this.path.split("/").slice(0, -1); const parts = [...base]; for (const seg of from.split("/")) { if (seg === "." || !seg) continue; if (seg === "..") parts.pop(); else parts.push(seg); } return parts.join("/"); }
@@ -221,7 +340,7 @@ class Proj {
         case "expr": this.w.emit(`${ind}${e(s.e)};`, 0); break;
         case "return": this.w.emit(`${ind}return${s.e ? " " + e(s.e) : ""};`, 0); break;
         case "throw": this.w.emit(`${ind}throw ${e(s.e)};`, 0); break;
-        case "write": case "optimistic": this.w.emit(`${ind}__.set(${this.target(s.target)})(${e(s.e)});`, 0); break;
+        case "write": case "optimistic": this.write(s.target, e(s.e), ind); break;
         case "refresh": case "affects": this.w.emit(`${ind}void ${s.name};`, 0); break;
         case "action": this.w.emit(`${ind}void (async () => {`, 0); this.stmts(s.body, ind + "  "); this.w.emit(`${ind}})();`, 0); break;
         case "sif": this.w.emit(`${ind}if (${e(s.c)}) {`, 0); this.stmts(s.t, ind + "  "); this.w.emit(`${ind}} else {`, 0); this.stmts(s.f, ind + "  "); this.w.emit(`${ind}}`, 0); break;
@@ -234,6 +353,17 @@ class Proj {
       }
     }
   }
+  /** TY-2: a write is checked against the slot's type, not the type a branch has narrowed the read to. */
+  private write(t: Target, v: string, ind: string) {
+    if (!t.ctx && this.slots.has(t.name)) {
+      let path = "";
+      for (const p of t.path) path += typeof p === "string" ? `.${p}` : `[${this.expr(p, true)}]`;
+      const base = t.path.length ? `(${t.name} as NonNullable<__W_${t.name}>)` : `(${t.name} as __W_${t.name})`;
+      this.w.emit(`${ind}__.set(${base}${path})(${v});`, 0);
+      return;
+    }
+    this.w.emit(`${ind}__.set(${this.target(t)})(${v});`, 0);
+  }
   private target(t: Target): string {
     let s = t.ctx ? `__.use(${t.name})` : t.name;
     for (const p of t.path) s += typeof p === "string" ? `.${p}` : `[${this.expr(p, true)}]`;
@@ -245,7 +375,7 @@ class Proj {
     const go = (x: Expr) => this.expr(x, imp, self);
     switch (e.k) {
       case "lit": return J(e.v);
-      case "id": if (BUILTINS.has(e.name) && !this.declared.has(e.name)) this.used.add(e.name); return e.name;
+      case "id": if (BUILTINS.has(e.name) && !this.declared.has(e.name)) this.used.add(e.name); return this.rename?.get(e.name) ?? e.name;
       case "pre": return e.name === self ? (e.init ? `__.pre(${go(e.init)})` : `__.pre<any>()`) : `__.pre<typeof ${e.name}>(${e.init ? go(e.init) : ""})`;
       case "peek": case "latest": return go(e.e);
       case "pending": return `__.pending(${go(e.e)})`;
@@ -257,20 +387,29 @@ class Proj {
       case "if": return `(${go(e.c)} ? ${go(e.t)} : ${go(e.f)})`;
       case "throw": return `__.raise(${go(e.e)})`;
       case "catch": return `__.caught(${go(e.e)}, (${e.name ?? "__e"}: ${e.classes ? e.classes.join(" | ") : "Error"}) => ${go(e.alt)})`;
-      case "tpl": return "`" + e.parts.map(p => typeof p === "string" ? p.replace(/[`\\]|\$\{/g, m => "\\" + m) : "${" + go(p) + "}").join("") + "`";
+      case "tpl": return "`" + e.parts.map(p => typeof p === "string" ? p.replace(/[`\\]|\$\{|[\x00-\x1f]/g, m => m.charCodeAt(0) < 32 ? "\\x" + m.charCodeAt(0).toString(16).padStart(2, "0") : "\\" + m) : "${" + go(p) + "}").join("") + "`";
       case "member": return `${go(e.o)}${e.opt ? "?." : "."}${e.p}`;
       case "index": return `${go(e.o)}${e.opt ? "?.[" : "["}${go(e.i)}]`;
       case "stylemap": { const r = transform(`export const __s = <style>${e.css}</style>;`, { filename: "class-map.tsrx", generate: "dom" }) as { code: string }; const m = /export const __s = (\{[\s\S]*?\});/.exec(r.code); return `(${m ? m[1].replace(/\n\s*/g, " ").replace(/: "[^"]*"/g, ': "" as string') : "{}"} as const)`; }   // 07 CSS-5: TSRX's class map, as its typecheck projection writes it
       case "call": return `${go(e.f)}(${e.args.map(go).join(", ")})`;
       case "arr": return `[${e.items.map(go).join(", ")}]`;
-      case "rec": return `({ ${e.fields.map(f => "spread" in f ? `...${go(f.spread)}` : `${J(f.key)}: ${go(f.v)}`).join(", ")} })`;
+      case "as": return `(${go(e.e)} as ${e.ty})`;
+      case "rec": return `({ ${e.fields.map(f => "spread" in f ? `...${go(f.spread)}` : `${"computed" in f ? `[${go(f.computed)}]` : J(f.key)}: ${go(f.v)}`).join(", ")} })`;
       case "spread": return `...${go(e.e)}`;
       case "omit": return `__.omit(${[go(e.e), ...e.keys.map(k => J(k))].join(", ")})`;
       case "fn": {
         const ps = e.params.join(", ");
-        if (!e.stmts) return `((${ps}) => ${this.expr(e.body, imp, self)})`;
-        const w = new W(); const saved = this.w; this.w = w; this.stmts(e.stmts, "  "); this.w = saved;
-        return `(${hasAwait(e.stmts) ? "async " : ""}(${ps}) => {\n${w.out.join("\n")}\n})`;
+        const names = imp ? this.handlerSnaps(e) : [];   // TY-2: a handler's reads are snapshots, so a view branch does not narrow them
+        const saved = this.rename;
+        if (names.length) { this.rename = new Map(saved); for (const n of names) this.rename.set(n, `__s_${n}`); }
+        let inner: string; let async = false;
+        if (!e.stmts) inner = this.expr(e.body, imp, self);
+        else { async = hasAwait(e.stmts); const w = new W(); const sw = this.w; this.w = w; this.stmts(e.stmts, "  "); this.w = sw; inner = w.out.join("\n"); }
+        this.rename = saved;
+        if (!names.length) return e.stmts ? `(${async ? "async " : ""}(${ps}) => {\n${inner}\n})` : `((${ps}) => ${inner})`;
+        const params = names.map(n => `__s_${n}: __W_${n}`).join(", ");
+        const args = names.join(", ");
+        return e.stmts ? `((${ps}) => ((${params}) => {\n${inner}\n})(${args}))` : `((${ps}) => ((${params}) => ${inner})(${args}))`;
       }
       case "serverfn": {                                                                       // SF-1d: an async function, its wire checked (TY-5a)
         const ps = e.params.map((n, i) => `${n}${e.ptypes?.[i] ? `: ${e.ptypes[i]}` : ""}`).join(", ");

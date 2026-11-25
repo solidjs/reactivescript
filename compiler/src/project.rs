@@ -10,7 +10,7 @@ use crate::signature::{ExportSig, ModSig};
 use indexmap::{IndexMap, IndexSet};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// The helpers every projection imports (`__`), and the prelude's names (`len`, `map`, …): `ref/types/project.ts`'s PRELUDE.
@@ -156,6 +156,14 @@ fn j(l: &Lit) -> String {
 fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap()
 }
+/// The namespace a `.d.rx` is declared as. Same spelling as `ref/types/project.ts`.
+fn ns_name(declared: &str) -> String {
+    let mut s = String::from("__D_");
+    for c in declared.chars() {
+        s.push(if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' });
+    }
+    s
+}
 fn is_handler(a: &str) -> bool {
     crate::awaits::is_handler(a)
 }
@@ -179,7 +187,7 @@ pub fn project_modules_with(set: &ModuleSet, prelude: Option<&str>) -> Vec<Proje
     for path in &set.order {
         let p = &set.programs[path];
         let src = set.sources.get(path).map(|s| s.as_str()).unwrap_or("");
-        let mut pr = Proj { w: W::new(), set, path, src, js_stubs: &mut js_stubs, used: IndexSet::new(), declared: HashSet::new(), prelude };
+        let mut pr = Proj { w: W::new(), set, path, src, js_stubs: &mut js_stubs, used: IndexSet::new(), declared: HashSet::new(), slots: HashSet::new(), snap: HashSet::new(), rename: HashMap::new(), ambients: HashSet::new(), bridged: HashSet::new(), prelude };
         pr.module(p);
         let w = pr.w;
         out.push(Projected { path: projected_path(path), code: w.buf.s, lines: w.lines, rx: path.clone(), mappings: w.buf.m, ranges: w.buf.r });
@@ -189,7 +197,7 @@ pub fn project_modules_with(set: &ModuleSet, prelude: Option<&str>) -> Vec<Proje
     }
     for (dts, decls) in &set.declarations {
         let path = dts.strip_suffix(".d.rx").map(|s| format!("{s}.d.ts")).unwrap_or(dts.clone());
-        out.push(Projected { path, code: declaration_file(decls), lines: vec![], rx: dts.clone(), mappings: vec![], ranges: vec![] });
+        out.push(Projected { path, code: declaration_module(dts, decls, set), lines: vec![], rx: dts.clone(), mappings: vec![], ranges: vec![] });
     }
     for (m, names) in js_stubs {
         let code = names.iter().map(|n| if n == "default" { "declare const __d: any; export default __d;".to_string() } else { format!("export declare const {n}: any;") }).collect::<Vec<_>>().join("\n");
@@ -224,24 +232,93 @@ fn signature_stub(sig: &ModSig) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-/// MO-8: a `.d.rx` as TypeScript's `.d.ts` for the same JS module.
+/// A module-level alias of an imported type, so a declare namespace can name it without importing the sibling `.ts`.
+fn bridge_name(path: &str, name: &str) -> String {
+    let mut s = String::from("__T_");
+    for c in path.chars() {
+        s.push(if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' });
+    }
+    s.push('_');
+    s.push_str(name);
+    s
+}
+/// A path from `from_file`'s directory to `to_file`, for an `import type` of an `.rx` projection.
+fn rel_module(from_file: &str, to_file: &str) -> String {
+    let from: Vec<&str> = from_file.split('/').collect();
+    let from = if from.is_empty() { &from[..] } else { &from[..from.len() - 1] };
+    let to: Vec<&str> = to_file.split('/').collect();
+    let mut i = 0;
+    while i < from.len() && i + 1 < to.len() && from[i] == to[i] {
+        i += 1;
+    }
+    let mut rel = "../".repeat(from.len() - i) + &to[i..].join("/");
+    if !rel.starts_with('.') {
+        rel = format!("./{rel}");
+    }
+    rel
+}
+/// MO-8: a `.d.rx` as TypeScript's `.d.ts` for the same JS module. An import is a local alias of its bridge (MO-8e).
 fn declaration_file(decls: &[JsDecl]) -> String {
     decls
         .iter()
         .map(|d| match d {
-            JsDecl::Type { text, .. } => format!("export {text}"),
+            JsDecl::Import { names, target, .. } => names.iter().map(|n| format!("type {} = {};", n.alias, target.as_ref().map(|t| bridge_name(t, &n.name)).unwrap_or_else(|| "any".into()))).collect::<Vec<_>>().join("\n"),
+            JsDecl::Type { text, exported, .. } => format!("{}{text}", if *exported { "export " } else { "" }),
             JsDecl::Error { name, .. } => format!("export declare class {name}$ extends Error {{}}\nexport declare const {name}: (message?: string) => {name}$;\nexport type {name} = {name}$;"),
-            JsDecl::Fn { name, params, ptypes, ret, .. } => {
+            JsDecl::Fn { name, params, generics, ptypes, ret, .. } => {
                 let ps = params.iter().enumerate().map(|(i, n)| match ptypes.get(i).and_then(|t| t.as_ref()) {
                     Some(t) => format!("{n}: {t}"),
                     None => n.clone(),
                 });
-                format!("export declare function {name}({}): {};", ps.collect::<Vec<_>>().join(", "), ret.as_deref().unwrap_or("any"))
+                format!("export declare function {name}{}({}): {};", generics.as_deref().unwrap_or(""), ps.collect::<Vec<_>>().join(", "), ret.as_deref().unwrap_or("any"))
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
+}
+fn ns_block(dts: &str, decls: &[JsDecl]) -> String {
+    let body = declaration_file(decls).trim_end().replace("export declare ", "export ").lines().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
+    format!("declare namespace {} {{\n{body}\n}}", ns_name(dts))
+}
+/// Dependency namespaces and the bridges this file's type imports name. `seen` holds `.d.rx` paths already emitted.
+fn decl_preamble(decls: &[JsDecl], set: &ModuleSet, from_file: &str, seen: &mut HashSet<String>, bridged: &mut HashSet<String>) -> String {
+    let mut out = String::new();
+    for d in decls {
+        let JsDecl::Import { names, target: Some(target), rx, .. } = d else { continue };
+        if !rx {
+            out.push_str(&dep_text(target, set, from_file, seen, bridged));
+        }
+        for n in names {
+            let b = bridge_name(target, &n.name);
+            if !bridged.insert(b.clone()) {
+                continue;
+            }
+            if *rx {
+                out.push_str(&format!("import type {{ {} as {b} }} from {};\n", n.name, js_str(&rel_module(from_file, target))));
+            } else {
+                out.push_str(&format!("type {b} = {}.{};\n", ns_name(target), n.name));
+            }
+        }
+    }
+    out
+}
+fn dep_text(target: &str, set: &ModuleSet, from_file: &str, seen: &mut HashSet<String>, bridged: &mut HashSet<String>) -> String {
+    if !seen.insert(target.to_string()) {
+        return String::new();
+    }
+    let Some(decls) = set.declarations.get(target) else { return String::new() };
+    format!("{}{}\n", decl_preamble(decls, set, from_file, seen, bridged), ns_block(target, decls))
+}
+/// The standalone `.d.ts`: a file with no type import is `declaration_file`, unchanged.
+fn declaration_module(dts: &str, decls: &[JsDecl], set: &ModuleSet) -> String {
+    if !decls.iter().any(|d| matches!(d, JsDecl::Import { .. })) {
+        return declaration_file(decls);
+    }
+    let mut seen = HashSet::new();
+    seen.insert(dts.to_string());
+    let mut bridged = HashSet::new();
+    format!("{}{}", decl_preamble(decls, set, dts, &mut seen, &mut bridged), declaration_file(decls))
 }
 
 /// `JSON.stringify(stmts).includes('"k":"await"')`: an `await` anywhere in them, closures included.
@@ -287,6 +364,16 @@ struct Proj<'a> {
     used: IndexSet<String>,
     /// names the module declares (they shadow the prelude)
     declared: HashSet<String>,
+    /// sources and equations: a write checks this type, not a branch's narrowing (TY-2)
+    slots: HashSet<String>,
+    /// a handler read is a fresh snapshot of this name's type (TY-2)
+    snap: HashSet<String>,
+    /// inside a handler, a snap name reads as its snapshot binding
+    rename: HashMap<String, String>,
+    /// a JS module's `.d.rx`, emitted once as the types the import is checked against (TY-4b)
+    ambients: HashSet<String>,
+    /// MO-8e: a type bridge already emitted in this projection
+    bridged: HashSet<String>,
     prelude: Option<&'a str>,
 }
 
@@ -384,6 +471,11 @@ impl Proj<'_> {
         for d in ds {
             if let Some(n) = d.name() {
                 self.declared.insert(n.to_string());
+            }
+            if matches!(d, Decl::Source { .. } | Decl::Eq { .. }) {
+                let n = d.name().unwrap().to_string();
+                self.slots.insert(n.clone()); // before actions, whose writes name them
+                self.snap.insert(n);
             }
         }
         for d in ds {
@@ -496,12 +588,14 @@ impl Proj<'_> {
                         None => Code::of("__.src(").c(self.expr(init, false, None)).t(")"),
                     };
                     self.w.emit(Code::of(ind).t(ex(d)).t("const ").c(nm).c(a).t(" = ").c(v).t(";").from(sp), *line);
+                    self.w.emit(Code::of(&format!("{ind}type __W_{name} = typeof {name};")), *line);
                 }
                 Decl::Eq { name, e, line, ty, .. } => {
                     let nm = self.name(name, sp, &mut at);
                     let a = self.ann(ty, sp, &mut at);
                     let v = Code::of("__.eq(").c(self.expr(e, false, Some(name))).t(", true)");   // R-1: no promise without `await`
                     self.w.emit(Code::of(ind).t(ex(d)).t("const ").c(nm).c(a).t(" = ").c(v).t(";").from(sp), *line);
+                    self.w.emit(Code::of(&format!("{ind}type __W_{name} = typeof {name};")), *line);
                 }
                 Decl::Provide { name, e, line, .. } => {
                     let nm = self.name(name, sp, &mut at);
@@ -527,16 +621,18 @@ impl Proj<'_> {
     fn import_decl(&mut self, d: &Decl, ind: &str) {
         let Decl::Import { names, from, line, resolved, declared, .. } = d else { return };
         let sp = d.span();
+        let is_prelude = |n: &ImportName| from == "./prelude" && builtin(&n.name);
         for n in names {
-            if builtin(&n.name) {
-                // the prelude's own (`import { log } from "./prelude"`)
+            if is_prelude(n) {
                 self.declared.remove(&n.alias);
+            } else {
+                self.declared.insert(n.alias.clone());
             }
         }
-        for n in names.iter().filter(|n| builtin(&n.name)) {
+        for n in names.iter().filter(|n| is_prelude(n)) {
             self.used.insert(n.name.clone());
         }
-        let rest: Vec<&ImportName> = names.iter().filter(|n| !builtin(&n.name)).collect();
+        let rest: Vec<&ImportName> = names.iter().filter(|n| !is_prelude(n)).collect();
         if rest.is_empty() {
             return;
         }
@@ -546,6 +642,13 @@ impl Proj<'_> {
             let s = self.js_stubs.entry(key).or_default();
             for n in &rest {
                 s.insert(n.name.clone());
+            }
+        }
+        if let Some(dts) = declared {
+            if let Some(decls) = self.set.declarations.get(dts) {
+                // TY-4b: the `.d.rx` is the type, even where a `.ts` sits beside it
+                self.declared_import(d, &rest, decls, ind);
+                return;
             }
         }
         let mut at = sp.start as usize;
@@ -574,6 +677,131 @@ impl Proj<'_> {
         let fa = self.find(&q[1..q.len() - 1], sp, at).map(|a| a - 1).filter(|a| self.src[*a..].starts_with(&q));
         c = c.t(" from ").at(&q, fa).t(";");
         self.w.emit(c, *line);
+        for n in &rest {
+            if !self.is_type_import(d, &n.name) {
+                self.snap_alias(&n.alias, ind, *line);
+            }
+        }
+    }
+    fn is_type_import(&self, d: &Decl, name: &str) -> bool {
+        let Decl::Import { resolved: Some(r), .. } = d else { return false };
+        if self.set.programs.get(r).is_some_and(|p| p.decls.iter().any(|x| matches!(x, Decl::TypeDecl { name: n, .. } if n == name))) {
+            return true;
+        }
+        self.set.signatures.get(r).and_then(|s| s.exports.get(name)).is_some_and(|x| matches!(x, ExportSig::Type))
+    }
+    /// Snap names a handler reads, not counting its parameters, its locals, or a nested arrow. Sorted, so both projections agree.
+    fn handler_snaps(&self, params: &[String], body: &Expr, stmts: Option<&[Stmt]>) -> Vec<String> {
+        let mut bound: HashSet<String> = params.iter().cloned().collect();
+        let mut out = HashSet::new();
+        fn expr(e: &Expr, snap: &HashSet<String>, bound: &HashSet<String>, out: &mut HashSet<String>) {
+            match &e.k {
+                ExprKind::Fn { .. } | ExprKind::ServerFn { .. } | ExprKind::Draft { .. } => {}
+                ExprKind::Id(n) => {
+                    if snap.contains(n) && !bound.contains(n) {
+                        out.insert(n.clone());
+                    }
+                }
+                ExprKind::Bin { l, r, .. } => { expr(l, snap, bound, out); expr(r, snap, bound, out); }
+                ExprKind::Un { e, .. } | ExprKind::Peek(e) | ExprKind::Latest(e) | ExprKind::Pending(e) | ExprKind::Spread(e) | ExprKind::Throw(e) | ExprKind::As { e, .. } => expr(e, snap, bound, out),
+                ExprKind::Pre { init, .. } => init.iter().for_each(|x| expr(x, snap, bound, out)),
+                ExprKind::Await { e, init, .. } => { expr(e, snap, bound, out); init.iter().for_each(|x| expr(x, snap, bound, out)); }
+                ExprKind::If { c, t, f } => { expr(c, snap, bound, out); expr(t, snap, bound, out); expr(f, snap, bound, out); }
+                ExprKind::Member { o, .. } => expr(o, snap, bound, out),
+                ExprKind::Index { o, i, .. } => { expr(o, snap, bound, out); expr(i, snap, bound, out); }
+                ExprKind::Call { f, args } => { expr(f, snap, bound, out); args.iter().for_each(|a| expr(a, snap, bound, out)); }
+                ExprKind::Arr(items) => items.iter().for_each(|a| expr(a, snap, bound, out)),
+                ExprKind::Rec(fields) => fields.iter().for_each(|f| match f {
+                    Field::Kv { v, .. } => expr(v, snap, bound, out),
+                    Field::Computed { key, v } => { expr(key, snap, bound, out); expr(v, snap, bound, out); }
+                    Field::Spread(x) => expr(x, snap, bound, out),
+                }),
+                ExprKind::Tpl(parts) => parts.iter().for_each(|p| if let TplPart::Expr(x) = p { expr(x, snap, bound, out) }),
+                ExprKind::Catch { e, alt, .. } => { expr(e, snap, bound, out); expr(alt, snap, bound, out); }
+                ExprKind::Omit { e, .. } => expr(e, snap, bound, out),
+                _ => {}
+            }
+        }
+        fn walk_stmts(ss: &[Stmt], snap: &HashSet<String>, bound: &mut HashSet<String>, out: &mut HashSet<String>) {
+            for s in ss {
+                match &s.k {
+                    StmtKind::Let { name, e, .. } => { expr(e, snap, bound, out); bound.insert(name.clone()); }
+                    StmtKind::Write { target, e } | StmtKind::Optimistic { target, e } => {
+                        for p in &target.path {
+                            if let PathSeg::Expr(x) = p { expr(x, snap, bound, out); }
+                        }
+                        expr(e, snap, bound, out);
+                    }
+                    StmtKind::Expr(e) | StmtKind::Throw(e) => expr(e, snap, bound, out),
+                    StmtKind::Return(Some(e)) => expr(e, snap, bound, out),
+                    StmtKind::Sif { c, t, f } => { expr(c, snap, bound, out); walk_stmts(t, snap, bound, out); walk_stmts(f, snap, bound, out); }
+                    StmtKind::Try { body, handler, fin, .. } => {
+                        walk_stmts(body, snap, bound, out);
+                        if let Some(h) = handler { walk_stmts(h, snap, bound, out); }
+                        if let Some(h) = fin { walk_stmts(h, snap, bound, out); }
+                    }
+                    StmtKind::Action(body) => walk_stmts(body, snap, bound, out),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(ss) = stmts { walk_stmts(ss, &self.snap, &mut bound, &mut out); } else { expr(body, &self.snap, &bound, &mut out); }
+        let mut v: Vec<String> = out.into_iter().collect();
+        v.sort();
+        v
+    }
+    /// A handler's read of this name is a snapshot of its type, not a branch's narrowing (TY-2).
+    fn snap_alias(&mut self, alias: &str, ind: &str, line: usize) {
+        self.snap.insert(alias.to_string());
+        self.w.emit(Code::of(&format!("{ind}type __W_{alias} = typeof {alias};")), line);
+    }
+    /// TY-4b: check the import against its `.d.rx`, not whatever TypeScript would resolve the JS module to.
+    fn declared_import(&mut self, d: &Decl, rest: &[&ImportName], decls: &[JsDecl], ind: &str) {
+        let Decl::Import { from, line, declared, .. } = d else { return };
+        // a declare namespace, not a module: nothing for TypeScript to resolve beside the `.ts`
+        let ns = ns_name(declared.as_deref().unwrap_or(from));
+        let dts = declared.clone().unwrap_or_default();
+        if self.ambients.insert(dts.clone()) {
+            let pre = if decls.iter().any(|d| matches!(d, JsDecl::Import { .. })) {
+                decl_preamble(decls, self.set, self.path, &mut self.ambients, &mut self.bridged)
+            } else {
+                String::new()
+            };
+            let body = declaration_file(decls).trim_end().replace("export declare ", "export ").lines().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
+            let block = format!("{ind}declare namespace {ns} {{\n{body}\n{ind}}}");
+            let text = if pre.is_empty() { block } else { format!("{}\n{block}", pre.trim_end()) };
+            self.w.emit(Code::of(&text), *line);
+        }
+        let of = |n: &str| decls.iter().find(|x| x.name() == n);
+        let values: Vec<&&ImportName> = rest.iter().filter(|n| !matches!(of(&n.name), Some(JsDecl::Type { .. }))).collect();
+        if !values.is_empty() {
+            let def = values.iter().find(|n| n.name == "default");
+            let parts: Vec<String> = values.iter().filter(|n| n.name != "default").map(|n| format!("{} as __js_{}", n.name, n.alias)).collect();
+            let mut s = format!("{ind}import ");
+            if let Some(def) = def {
+                s.push_str(&format!("__js_{}", def.alias));
+                if !parts.is_empty() {
+                    s.push_str(", ");
+                }
+            }
+            if !parts.is_empty() {
+                s.push_str(&format!("{{ {} }}", parts.join(", ")));
+            }
+            s.push_str(&format!(" from {};", js_str(from)));
+            self.w.emit(Code::of(&s), *line);
+        }
+        for n in rest {
+            let x = of(&n.name);
+            if x.is_none() || matches!(x, Some(JsDecl::Type { .. })) {
+                self.w.emit(Code::of(&format!("{ind}type {} = {ns}.{};", n.alias, n.name)), *line);
+            } else {
+                self.w.emit(Code::of(&format!("{ind}const {} = __js_{} as typeof {ns}.{};", n.alias, n.alias, n.name)), *line);
+                self.snap_alias(&n.alias, ind, *line);
+            }
+            if matches!(x, Some(JsDecl::Error { .. })) {
+                self.w.emit(Code::of(&format!("{ind}type {} = {ns}.{};", n.alias, n.name)), *line);
+            }
+        }
     }
     /// A JS import's module, from the program's root (where the stubs are written).
     fn mod_path(&self, from: &str) -> String {
@@ -656,9 +884,26 @@ impl Proj<'_> {
                     self.w.emit(Code::of(&format!("{ind}throw ")).c(v).t(";").from(sp), 0);
                 }
                 StmtKind::Write { target, e } | StmtKind::Optimistic { target, e } => {
-                    let t = self.target(target, sp, &mut at);
                     let v = self.expr(e, true, None);
-                    self.w.emit(Code::of(&format!("{ind}__.set(")).c(t).t(")(").c(v).t(");").from(sp), 0);
+                    // TY-2: a write is checked against the slot's type, not the type a branch has narrowed the read to.
+                    if !target.is_ctx() && self.slots.contains(&target.name) {
+                        let mut path = String::new();
+                        for p in &target.path {
+                            match p {
+                                PathSeg::Name(n) => path.push_str(&format!(".{n}")),
+                                PathSeg::Expr(x) => path.push_str(&format!("[{}]", self.expr(x, true, None).s)),
+                            }
+                        }
+                        let base = if target.path.is_empty() {
+                            format!("({} as __W_{})", target.name, target.name)
+                        } else {
+                            format!("({} as NonNullable<__W_{}>)", target.name, target.name)
+                        };
+                        self.w.emit(Code::of(&format!("{ind}__.set({base}{path})(")).c(v).t(");").from(sp), 0);
+                    } else {
+                        let t = self.target(target, sp, &mut at);
+                        self.w.emit(Code::of(&format!("{ind}__.set(")).c(t).t(")(").c(v).t(");").from(sp), 0);
+                    }
                 }
                 StmtKind::Refresh(n) | StmtKind::Affects(n) => {
                     let nm = self.name(n, sp, &mut at);
@@ -735,7 +980,10 @@ impl Proj<'_> {
                     self.used.insert(n.clone());
                 }
                 let at = src_at(n);
-                Code::new().at(n, at)
+                match self.rename.get(n) {
+                    Some(r) => Code::of(r),
+                    None => Code::new().at(n, at),
+                }
             }
             ExprKind::Pre { name, init } => {
                 let mut from = sp.start as usize;
@@ -751,6 +999,7 @@ impl Proj<'_> {
                 }
             }
             ExprKind::Peek(x) | ExprKind::Latest(x) => go!(x),
+            ExprKind::As { e: x, ty } => Code::of("(").c(go!(x)).t(" as ").c(self.ty(ty, e.span, &mut (x.span.end as usize))).t(")"),
             ExprKind::Pending(x) => Code::of("__.pending(").c(go!(x)).t(")"),
             ExprKind::Await { e: x, init, stream } => {
                 if imp {
@@ -802,6 +1051,7 @@ impl Proj<'_> {
                     .map(|f| match f {
                         Field::Spread(x) => Code::of("...").c(go!(x)),
                         Field::Kv { key, v } => Code::of(&js_str(key)).t(": ").c(go!(v)),
+                        Field::Computed { key, v } => Code::of("[").c(go!(key)).t("]: ").c(go!(v)),
                     })
                     .collect();
                 Code::of("({ ").c(Code::join(fs, ", ")).t(" })")
@@ -814,11 +1064,33 @@ impl Proj<'_> {
             ExprKind::Fn { params, body, stmts } => {
                 let mut from = sp.start as usize;
                 let ps = Code::join(params.iter().map(|p| self.name(p, sp, &mut from)).collect(), ", ");
-                let Some(ss) = stmts else {
-                    return Code::of("((").c(ps).t(") => ").c(self.expr(body, imp, me)).t(")");
+                let names = if imp { self.handler_snaps(params, body, stmts.as_deref()) } else { vec![] };
+                let saved = self.rename.clone();
+                if !names.is_empty() {
+                    for n in &names {
+                        self.rename.insert(n.clone(), format!("__s_{n}"));
+                    }
+                }
+                let (inner, is_stmt, is_async) = if let Some(ss) = stmts {
+                    (self.nested(|me| me.stmts(ss, "  ")), true, has_await(ss))
+                } else {
+                    (self.expr(body, imp, me), false, false)
                 };
-                let inner = self.nested(|me| me.stmts(ss, "  "));
-                Code::of(if has_await(ss) { "(async (" } else { "((" }).c(ps).t(") => {\n").c(inner).t("\n})")
+                self.rename = saved;
+                if names.is_empty() {
+                    return if is_stmt {
+                        Code::of(if is_async { "(async (" } else { "((" }).c(ps).t(") => {\n").c(inner).t("\n})")
+                    } else {
+                        Code::of("((").c(ps).t(") => ").c(inner).t(")")
+                    };
+                }
+                let params_s = names.iter().map(|n| format!("__s_{n}: __W_{n}")).collect::<Vec<_>>().join(", ");
+                let args = names.join(", ");
+                if is_stmt {
+                    Code::of("((").c(ps).t(&format!(") => (({params_s}) => {{\n")).c(inner).t(&format!("\n}})({args}))"))
+                } else {
+                    Code::of("((").c(ps).t(&format!(") => (({params_s}) => ")).c(inner).t(&format!(")({args}))"))
+                }
             }
             ExprKind::ServerFn { params, ptypes, ret, body } => {
                 let mut from = sp.start as usize;
@@ -975,7 +1247,7 @@ impl Proj<'_> {
     }
 }
 
-/// A template literal's text: `` ` ``, `\` and `${` escaped.
+/// A template literal's cooked text, escaped back into TSX.
 fn escape_tpl(s: &str) -> String {
     let mut out = String::new();
     let mut it = s.chars().peekable();
@@ -989,6 +1261,7 @@ fn escape_tpl(s: &str) -> String {
                 out.push_str("\\${");
                 it.next();
             }
+            '\x00'..='\x1f' => out.push_str(&format!("\\x{:02x}", c as u32)),
             _ => out.push(c),
         }
     }
