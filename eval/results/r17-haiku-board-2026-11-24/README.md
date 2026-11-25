@@ -8,15 +8,17 @@ passes and the after-left family.
 
 | app | tests kept | fuzz seeds | defects |
 |---|---|---|---|
-| 1 | 2 | 8 | 10 |
+| 1 | 2 | 3 | 5 |
 | 2 | 0 | 4 | 4 |
 | 3 | 1 | 0 | 1 |
 | 4 | 1 | 2 | 3 |
 | 5 | 1 | 5 | 6 |
 | 6 | 1 | 1 | 2 |
-| mean | | | **4.33** (r16 Haiku board 19.0) |
+| mean | | | **3.50** (rerun Haiku board 17.0) |
 
-With the two Solid bugs below fixed: 9, 4, 1, 3, 4, 2 = 3.83. No duplicate-id holes (AC-1h's family) remain.
+2026-11-25: fuzz regraded with B6 (Ryan: the detail reads every column, so it may say loading while a column's fetch
+is in the air), `grades/*.fuzz-b6.txt`; app 1 went from 8 seeds to 3 (before B6 the mean was 4.33). Every app also
+ran `holds-item-reload` and `holds-rename-decline`. With the two Solid bugs below fixed: 4, 4, 1, 3, 4, 2 = 3.00. No duplicate-id holes (AC-1h's family) remain.
 
 Hold probes (all ruled fine by Ryan 2026-11-25): `holds/` (round 15 probes, the rerun's, and `../rerun-2026-11-23/trace/holds-item-reload.mjs`, new: app 4
 holds an item add until its toggle's column re-asks land, which the hidden test never answers; it settles right).
@@ -44,7 +46,9 @@ Ours, fixed here:
   guess a count as a change.
 
 Agent:
-- app 1, 6 seeds (4, 8, 11, 15, 18, 20) "detail says loading card": the detail's `loading on(sel)` borrows lists with no `-> v`.
+- ~~app 1, 6 seeds (4, 8, 11, 15, 18, 20) "detail says loading card"~~: valid under B6 (Ryan 2026-11-25). Seed 8 then
+  shows "limit": after `left #3` fills Doing, a To do card's right stays enabled; `full = doingCards.length >= 3` reads
+  the same list the column renders. Untraced.
 - app 1 "a column's retry shows loading": Done's buttons read `full` over Doing, which never answers in the test, so
   Done waits on it (guide §1 says to give the answer a value where it's declared).
 - apps 1, 5 "an earlier move declined while a later move is out": app 1 re-asks only the lists the shown move

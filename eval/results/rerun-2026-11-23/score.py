@@ -1,10 +1,12 @@
 import re,glob,os,collections
 LEFT = re.compile(r"after (the|its)? ?(board|archive|issues page|page) was left|answers after the page was left")
 rows=[]; kept_all=collections.Counter()
-for p in sorted(glob.glob("grades/*-rx-*.txt")):
+for p in sorted(p for p in glob.glob("grades/*-rx-*.txt") if p.count(".")==1):
     d=p[7:-4]; t=open(p).read()
     fails=[f.strip() for f in re.findall(r"^✗ (.*?)\s*$",t,re.M)]
     fz=re.search(r"(\d+)/20 seeds found a hole",t); seeds=int(fz.group(1)) if fz else 20
+    if os.path.exists(f"grades/{d}.fuzz-b6.txt"):   # fuzz regraded with B6 (Ryan 2026-11-25); apps with no hole before kept
+        fz=re.search(r"(\d+)/20 seeds found a hole",open(f"grades/{d}.fuzz-b6.txt").read()); seeds=int(fz.group(1)) if fz else 20
     holdok=set(); holdbad=set()
     for h in glob.glob(f"holds/{d}.*.txt"):
         for m in re.finditer(r"^(✓|✗) HOLD (.*?)\s*$",open(h).read(),re.M):

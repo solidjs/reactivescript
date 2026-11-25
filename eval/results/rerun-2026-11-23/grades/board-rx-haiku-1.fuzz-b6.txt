@@ -1,0 +1,5 @@
+board-rx-haiku-1: 2/20 seeds found a hole
+  seed 10 step 27: detail column: #2 shows in To do, the detail says "#undefined undefinedin Donerenamearchiveloading checklist"
+    tab archive ; tab board ; add Alpha 1 ; land fetchCards:todo ; add Bravo 2 ; land fetchArchived: ; land addCard:todo,Bravo 2 ; land fetchCards:done ; land addCard:todo,Alpha 1 ; select #5 ; land fetchCards:doing ; land fetchCards:todo ; right #3 ; rename Alpha ; rename Alpha ; add Alpha 3 ; rename Bravo ; land addCard:todo,Alpha 3 ; rename Bravo ; land moveCard:3,done,1 ; fail renameCard:5,Bra
+  seed 15 step 21: limit: Doing shows 3 cards and a To do card's right is enabled
+    land fetchCards:doing ; select #4 ; up #4 ; land fetchCards:done ; fail moveCard:4,doing,0 ; land fetchCards:todo ; rename Bravo ; fail fetchChecklist:4 ; select #4 ; land renameCard:4,Bravo ; add Alpha 1 ; add Alpha 2 ; land fetchCards:todo ; add Bravo 3 ; select #5 ; land fetchCards:doing ; down #1 ; right #2 ; rename Alpha ; land renameCard:5,Alpha ; land addCard:todo,Alpha 2

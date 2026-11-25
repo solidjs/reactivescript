@@ -1,0 +1,7 @@
+board-rx-haiku-1: 3/20 seeds found a hole
+  seed 6 step 27: two views: card "#1 Write spec · 0/2", detail "#1 Fix loginin To dorenamearchiveloading checklist"
+    add Bravo 1 ; fail fetchCards:doing ; land fetchCards:done ; land fetchCards:doing ; land fetchCards:todo ; add Bravo 2 ; left #5 ; tab archive ; land fetchArchived: ; tab board ; tab archive ; tab board ; add Alpha 3 ; land fetchCards:done ; add Delta 4 ; tab archive ; tab board ; land fetchCards:done ; land fetchCards:todo ; add Alpha 5 ; land moveCard:5,doing,2 ; fail fetchCards:doing ; lan
+  seed 8 step 26: limit: Doing shows 3 cards and a To do card's right is enabled
+    land fetchCards:doing ; right #3 ; select #4 ; fail fetchCards:done ; left #3 ; retry-done ; fail fetchCards:todo ; up #4 ; select #4 ; land fetchCards:done ; select #5 ; land fetchChecklist:5 ; retry-todo ; left #5 ; land fetchChecklist:4 ; right #3 ; land fetchCards:todo ; down #1 ; land moveCard:3,done,0 ; land fetchCards:todo ; land fetchCards:done ; land moveCard:4,doing,0 ; toggle 1 ; se
+  seed 19 step 30: page error: declined
+    land fetchCards:todo ; tab archive ; land fetchCards:done ; tab board ; land fetchArchived: ; fail fetchCards:todo ; land fetchCards:done ; add Alpha 1 ; land fetchCards:doing ; left #4 ; add Alpha 2 ; tab archive ; tab board ; land fetchCards:todo ; add Alpha 3 ; tab archive ; tab board ; land fetchCards:doing ; land fetchCards:done ; tab archive ; tab board ; land fetchCards:doing ; add Alph

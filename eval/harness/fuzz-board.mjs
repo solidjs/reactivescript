@@ -26,6 +26,8 @@
 //   count may keep a declined toggle or item add while other work is in the air. At rest none of these.
 // - Two accepted writes to one field: settled, the field must show the server's last answer (Ryan, 2026-11-14).
 // - B5: while a column has failed, the detail may show its errored fallback, but never a wrong column or title.
+// - B6 (Ryan, 2026-11-25): the detail reads every column, so while a column's fetch is in the air it may say it is
+//   loading, but never a wrong column or title.
 // - B4 (follows from that ruling): while anything is in the air, a card's count may keep accepted toggles of an item
 //   that was toggled more than once in that busy period, since their answers may have come back in another order than
 //   the clicks (the screen keeps the last click until its re-ask lands). At rest, the server's count.
@@ -206,7 +208,9 @@ async function session(browser, url, seed, steps, log, others = false) {
         // its errored fallback (that it can't show the card now) instead; it must still never name a wrong column or title.
         // Derived from an error is errored (Ryan, 2026-11-24): that holds until the failed column answers again, also while
         // its retry is out
-        const failed = failedCols.size > 0 || (await Promise.all(COLS.map(cl => exists(`retry-${cl}`)))).some(Boolean);
+        // B6 (Ryan, 2026-11-25): for the same reason, while a column's fetch is in the air it may say it is loading
+        const loadingCol = /loading/i.test(detail) && (await pending()).some(k => k.startsWith("fetchCards:"));
+        const failed = loadingCol || failedCols.size > 0 || (await Promise.all(COLS.map(cl => exists(`retry-${cl}`)))).some(Boolean);
         const wrongCol = COLS.some(cl => cl !== col && detail.includes(`in ${NAME[cl]}`));
         if (failed ? wrongCol : !detail.includes(`in ${NAME[col]}`)) note("detail column", `#${x.id} shows in ${NAME[col]}, the detail says "${detail.slice(0, 80)}"`);
         if (!detail.includes(`#${x.id} ${x.title}`) && (!failed || detail.includes(`#${x.id} `))) note("two views", `card "${x.text}", detail "${detail.slice(0, 80)}"`);

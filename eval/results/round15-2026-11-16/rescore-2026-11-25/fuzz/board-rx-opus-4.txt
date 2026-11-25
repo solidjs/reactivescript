@@ -1,0 +1,9 @@
+board-rx-opus-4: 4/20 seeds found a hole
+  seed 11 step 42: duplicate card: #5 shows in doing and done
+    add Bravo 1 ; (move failed: locator.click: Timeout 2000ms exceeded.) ; tab archive ; tab board ; add Bravo 2 ; (move failed: locator.click: Timeout 2000ms exceeded.) ; tab archive ; tab board ; add Alpha 3 ; (move failed: locator.click: Timeout 2000ms exceeded.) ; land fetchCards:doing ; select #4 ; down #3 ; rename Alpha ; up #3 ; archive #4 ; land fetchCards:done ; land moveCard:3,doing,1 ; 
+  seed 17 step 25: count: card "#4 Alpha · 1/3", progress "0/3 done"
+    add Bravo 1 ; (move failed: locator.click: Timeout 2000ms exceeded.) ; land fetchCards:todo ; land fetchCards:done ; add Alpha 2 ; land fetchCards:doing ; right #3 ; right #4 ; right #2 ; land addCard:todo,Alpha 2 ; land moveCard:4,done,2 ; select #10 ; select #4 ; land moveCard:3,done,1 ; land fetchChecklist:10 ; land fetchChecklist:4 ; add-item docs 3 ; land moveCard:2,doing,0 ; rename Alpha
+  seed 18 step 38: duplicate card: #5 shows in todo and doing
+    land fetchCards:doing ; land fetchCards:done ; select #3 ; right #4 ; land fetchChecklist:3 ; land moveCard:4,done,1 ; add Alpha 1 ; (move failed: locator.click: Timeout 2000ms exceeded.) ; down #5 ; fail moveCard:5,done,1 ; land fetchCards:todo ; right #1 ; down #3 ; rename Delta ; land renameCard:3,Delta ; land moveCard:1,doing,1 ; left #4 ; add-item ship 2 ; rename Bravo ; fail moveCard:3,d
+  seed 20 step 41: page error: Invalid array length
+    add Bravo 1 ; (move failed: locator.click: Timeout 2000ms exceeded.) ; land fetchCards:doing ; add Bravo 2 ; (move failed: locator.click: Timeout 2000ms exceeded.) ; select #3 ; land fetchCards:done ; land fetchChecklist:3 ; land fetchCards:todo ; right #2 ; add-item qa 3 ; left #4 ; left #5 ; select #1 ; land fetchChecklist:1 ; toggle 1 ; rename Delta ; land moveCard:2,doing,2 ; tab archive ;

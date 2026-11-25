@@ -1,0 +1,6 @@
+✗ HOLD an add accepted while To do reloads shows the card once
+    locator.fill: Timeout 30000ms exceeded.
+✗ HOLD two renames, the later declined after the earlier was accepted: the earlier title stays
+    locator.click: Timeout 30000ms exceeded.
+
+0/2 passed

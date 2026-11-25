@@ -1,0 +1,5 @@
+board-rx-opus-2: 2/20 seeds found a hole
+  seed 10 step 31: count: card "#2 Delta · 2/3", progress "1/3 done"
+    tab archive ; tab board ; add Alpha 1 ; (move failed: locator.fill: Timeout 2000ms exceeded.) ; land fetchCards:todo ; select #1 ; land fetchCards:done ; land fetchChecklist:1 ; land fetchCards:doing ; add Alpha 2 ; land fetchArchived: ; fail addCard:todo,Alpha 2 ; select #2 ; land fetchChecklist:2 ; toggle 1 ; rename Delta ; land toggleItem:2,22,true ; land fetchCards:doing ; land fetchCards:
+  seed 12 step 15: heading: head-doing counts 2, the column shows 1 cards
+    land fetchCards:todo ; select #1 ; add Bravo 1 ; select #2 ; land fetchChecklist:1 ; down #1 ; up #1 ; up #2 ; land fetchCards:doing ; fail addCard:todo,Bravo 1 ; land fetchCards:done ; right #4 ; land moveCard:1,todo,1 ; select #2 ; left #4

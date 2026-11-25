@@ -1,0 +1,4 @@
+  expected screen
+✓ HOLD an item added while the checklist reloads shows once
+
+1/1 passed

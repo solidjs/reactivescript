@@ -1,0 +1,9 @@
+  assign declined: expected screen
+  settled: list ["#1 Login fails (unassigned)","#3 Crash at boot (unassigned)","#4 Typo in footer (dana)"]
+✓ HOLD base: a declined assignment keeps a rename in flight on the same issue
+✗ HOLD base: a declined rename keeps an assignment in flight on the same issue
+    page.evaluate: Error: no flight in the air for renameIssue:3,Crash at boot; in the air: fetchLabels:3 | fetchComments:3 | search:Crash on save | assign:3,ann
+✗ HOLD rows: a declined row close leaves a rename out on another issue
+    page.evaluate: Error: no flight in the air for closeIssue:1; in the air: fetchLabels:3 | fetchComments:3 | search:Crash on save | renameIssue:3,Crash at boot
+
+1/3 passed

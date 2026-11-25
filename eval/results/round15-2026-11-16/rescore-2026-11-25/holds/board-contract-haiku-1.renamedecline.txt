@@ -1,0 +1,6 @@
+✗ HOLD a rename and a move out together, the move declined: the card goes back with its new title
+    locator.click: Timeout 30000ms exceeded.
+✗ HOLD a declined archive of a card whose rename is out brings it back with the new title
+    locator.click: Timeout 30000ms exceeded.
+
+0/2 passed

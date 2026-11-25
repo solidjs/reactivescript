@@ -1,0 +1,4 @@
+✗ HOLD the new-card input starts empty when the board opens again
+    locator.fill: Timeout 30000ms exceeded.
+
+0/1 passed
