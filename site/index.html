@@ -50,7 +50,10 @@
   pre { font: 14px/1.55 var(--mono); font-variant-ligatures: none; background: var(--tile); border: 1px solid var(--line); border-radius: 12px;
     padding: 16px 18px; margin: 0 0 14px; overflow-x: auto; }
   pre code { background: none; padding: 0; font-size: inherit; }
-  pre.err { border-color: #5a2a33; background: #1d1626; color: var(--red); white-space: pre-wrap; }
+  pre.err { border-color: #5a2a33; background: #1d1626; color: var(--text); white-space: normal; line-height: 1.65; }
+  pre.err code { display: block; white-space: pre-wrap; overflow-wrap: break-word; }
+  pre.err code + code { margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255, 138, 128, 0.16); }
+  .eh { color: var(--red); font-weight: 600; } .eg { color: var(--muted); } .ef { color: var(--blue); font-weight: 600; } .ec { color: #a8d59b; } .ed { color: #6f86a6; white-space: nowrap; }
   .fname { display: block; font: 12px var(--mono); color: var(--muted); margin: 0 0 6px; }
   .k { color: var(--blue); } .w { color: var(--amber); } .s { color: #a8d59b; } .c { color: #6f86a6; } .t { color: #c9a7f2; }
   .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 8px; }
@@ -100,7 +103,7 @@
   &lt;button onClick={() =&gt; { count := count + <span class="t">1</span> }}&gt;{count} × 2 = {double}&lt;/button&gt;
 }</code></pre>
   <p>Write to the equation instead, <code>double := 4</code>, and the checker refuses it, in your editor and in CI:</p>
-<pre class="err"><code>counter.rx:5:3 - error WRITE_TO_NON_SOURCE: double is an equation: only sources are written (W-1)</code></pre>
+<pre class="err"><code><span class="eg">counter.rx:5:3 -</span> <span class="eh">error WRITE_TO_NON_SOURCE</span>: double is an equation: only sources are written <span class="ed">(W-1)</span></code></pre>
 
   <h2>Destructure props, keep them live</h2>
   <p>In Solid, destructuring props reads them once and the component stops updating. In .rx, destructure them right in the parameter list: every name follows its prop, defaults and rest included, and the rest spreads onto an element as in JSX.</p>
@@ -131,7 +134,7 @@
   &lt;/section&gt;
 }</code></pre>
   <p>There's a <code>loading</code> boundary but no <code>errored</code> one, so the checker says what's missing and how to fix it:</p>
-<pre class="err"><code>profile.rx:10:7 - error UNHANDLED_FAILURE: a reader of user.name (in &lt;Profile&gt;) can fail with Error and no catch or errored boundary above it discharges Error — show it where it is read: `errored fallback(e) { … } { … }` around the reader (or `await … catch (e) =&gt; …` at the await, to make the rejection an answer) (R-f-5)</code></pre>
+<pre class="err"><code><span class="eg">profile.rx:10:7 -</span> <span class="eh">error UNHANDLED_FAILURE</span>: a reader of user.name (in &lt;Profile&gt;) can fail with Error and no catch or errored boundary above it discharges Error <span class="ef">—</span> show it where it is read: <span class="ec">`errored fallback(e) { … } { … }`</span> around the reader (or <span class="ec">`await … catch (e) =&gt; …`</span> at the await, to make the rejection an answer) <span class="ed">(R-f-5)</span></code></pre>
 
   <h2>A like button, the first time you write it</h2>
   <p>Show the new count at once, send it, and let the server's answer replace the guess. That's <code>guess</code>, which lowers to Solid's <code>createOptimistic</code>. This is how most people write it first:</p>
@@ -150,9 +153,9 @@
   &lt;button onClick={() =&gt; { send() }}&gt;♥ {likes}&lt;/button&gt;
 }</code></pre>
   <p>It has three bugs, and two only show when the network is slow or a request fails. The checker finds all three:</p>
-<pre class="err"><code>like.rx:13:3 - error UNHANDLED_FAILURE: a reader of likes (in &lt;Like&gt;) can fail with Error and no catch or errored boundary above it discharges Error — show it where it is read: `errored fallback(e) { … } { … }` around the reader (or `await … catch (e) =&gt; …` at the await, to make the rejection an answer) (R-f-5)
-like.rx:7:3 - error UNCAUGHT_ACTION_FAILURE: action send can fail with Error and does not catch it: a handler cannot (it does not await the action) — `try { … } catch (e) { … }` in the body (R-f-6)
-like.rx:13:3 - error GUESS_WHILE_LOADING: &lt;button&gt; onClick starts `send`, which can run `guess likes` while likes is loading a new question (its question reads what the click reads): the guess composes on the previous answer, and the new answer replaces it, so the change disappears while it is out (D-34) — put the element inside the `loading` region whose content reads likes, or give it `disabled={pending? likes}`, or keep the pending change in a source of its own until it lands (AC-3a)</code></pre>
+<pre class="err"><code><span class="eg">like.rx:13:3 -</span> <span class="eh">error UNHANDLED_FAILURE</span>: a reader of likes (in &lt;Like&gt;) can fail with Error and no catch or errored boundary above it discharges Error <span class="ef">—</span> show it where it is read: <span class="ec">`errored fallback(e) { … } { … }`</span> around the reader (or <span class="ec">`await … catch (e) =&gt; …`</span> at the await, to make the rejection an answer) <span class="ed">(R-f-5)</span></code>
+<code><span class="eg">like.rx:7:3 -</span> <span class="eh">error UNCAUGHT_ACTION_FAILURE</span>: action send can fail with Error and does not catch it: a handler cannot (it does not await the action) <span class="ef">—</span> <span class="ec">`try { … } catch (e) { … }`</span> in the body <span class="ed">(R-f-6)</span></code>
+<code><span class="eg">like.rx:13:3 -</span> <span class="eh">error GUESS_WHILE_LOADING</span>: &lt;button&gt; onClick starts <span class="ec">`send`</span>, which can run <span class="ec">`guess likes`</span> while likes is loading a new question (its question reads what the click reads): the guess composes on the previous answer, and the new answer replaces it, so the change disappears while it is out <span class="ed">(D-34)</span> <span class="ef">—</span> put the element inside the <span class="ec">`loading`</span> region whose content reads likes, or give it <span class="ec">`disabled={pending? likes}`</span>, or keep the pending change in a source of its own until it lands <span class="ed">(AC-3a)</span></code></pre>
   <p>The last one is the subtle one. Click while the count is still reloading and your +1 lands on the old answer, then vanishes when the new one arrives. Each error names the fix, and the fixed version passes:</p>
 <pre class="ok"><span class="fname">like.rx</span><code><span class="k">export default component</span> Like(props: { id: number }) {
   likes = <span class="k">await</span> fetchLikes(props.id) <span class="k">catch</span> (e) =&gt; <span class="t">0</span>
@@ -180,7 +183,7 @@ like.rx:13:3 - error GUESS_WHILE_LOADING: &lt;button&gt; onClick starts `send`, 
   <span class="k">let</span> r = <span class="k">await</span> saveName(<span class="s">"Ann"</span>) <span class="k">catch</span> (e) =&gt; e.message
   status := r
 }}&gt;{status}&lt;/button&gt;</code></pre>
-<pre class="err"><code>save.rx:5:3 - error HELD_WRITE: status := … comes before an `await` in a body that is an action because it writes and awaits (AC-1b), so it is held until the body ends (AC-1): for state that shows while the work runs, `guess status := …` (a source with a question, ST-5c); for a reset that lands now, `onFlush(() =&gt; { status := … })` (EF-8); to hold it on purpose, declare the action (`action name() { … }`); or write it after the `await` (AC-1c)</code></pre>
+<pre class="err"><code><span class="eg">save.rx:5:3 -</span> <span class="eh">error HELD_WRITE</span>: status := … comes before an <span class="ec">`await`</span> in a body that is an action because it writes and awaits <span class="ed">(AC-1b)</span>, so it is held until the body ends <span class="ed">(AC-1)</span>: for state that shows while the work runs, <span class="ec">`guess status := …`</span> (a source with a question, <span class="ed">ST-5c</span>); for a reset that lands now, <span class="ec">`onFlush(() =&gt; { status := … })`</span> <span class="ed">(EF-8)</span>; to hold it on purpose, declare the action (<span class="ec">`action name() { … }`</span>); or write it after the <span class="ec">`await`</span> <span class="ed">(AC-1c)</span></code></pre>
     <h3>The write that undoes another click</h3>
     <p>Read, await, write back. If anything changed <code>tags</code> in between, this overwrites it.</p>
 <pre><code><span class="k">action</span> add(t: string) {
@@ -188,7 +191,7 @@ like.rx:13:3 - error GUESS_WHILE_LOADING: &lt;button&gt; onClick starts `send`, 
   <span class="k">let</span> saved = <span class="k">await</span> addTag(t) <span class="k">catch</span> (e) =&gt; t
   tags := before + <span class="s">" "</span> + saved
 }</code></pre>
-<pre class="err"><code>tags.rx:5:3 - error STALE_WRITE_BACK: tags := … after an `await` is computed from tags as it was read before that `await`: whatever changed tags in between (another action, a reload) is overwritten — write functionally (`tags := v =&gt; …`, W-6), which applies to tags as it stands at the write, or guess it (`guess`, AC-3) and let the answer replace the guess (AC-1e)</code></pre>
+<pre class="err"><code><span class="eg">tags.rx:5:3 -</span> <span class="eh">error STALE_WRITE_BACK</span>: tags := … after an <span class="ec">`await`</span> is computed from tags as it was read before that <span class="ec">`await`</span>: whatever changed tags in between (another action, a reload) is overwritten <span class="ef">—</span> write functionally (<span class="ec">`tags := v =&gt; …`</span>, <span class="ed">W-6</span>), which applies to tags as it stands at the write, or guess it (<span class="ec">`guess`</span>, <span class="ed">AC-3</span>) and let the answer replace the guess <span class="ed">(AC-1e)</span></code></pre>
   </div>
 
   <h2>Every word is a Solid primitive</h2>
