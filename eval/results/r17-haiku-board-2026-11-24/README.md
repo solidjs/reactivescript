@@ -18,7 +18,7 @@ passes and the after-left family.
 
 2026-11-25: fuzz regraded with B6 (Ryan: the detail reads every column, so it may say loading while a column's fetch
 is in the air), `grades/*.fuzz-b6.txt`; app 1 went from 8 seeds to 3 (before B6 the mean was 4.33). Every app also
-ran `holds-item-reload` and `holds-rename-decline`. With the two Solid bugs below fixed: 4, 4, 1, 3, 4, 2 = 3.00. No duplicate-id holes (AC-1h's family) remain.
+ran `holds-item-reload` and `holds-rename-decline`. With the Solid bugs below fixed: 3, 4, 1, 3, 4, 2 = 2.83. No duplicate-id holes (AC-1h's family) remain.
 
 Hold probes (all ruled fine by Ryan 2026-11-25): `holds/` (round 15 probes, the rerun's, and `../rerun-2026-11-23/trace/holds-item-reload.mjs`, new: app 4
 holds an item add until its toggle's column re-asks land, which the hidden test never answers; it settles right).
@@ -47,8 +47,9 @@ Ours, fixed here:
 
 Agent:
 - ~~app 1, 6 seeds (4, 8, 11, 15, 18, 20) "detail says loading card"~~: valid under B6 (Ryan 2026-11-25). Seed 8 then
-  shows "limit": after `left #3` fills Doing, a To do card's right stays enabled; `full = doingCards.length >= 3` reads
-  the same list the column renders. Untraced.
+  shows "limit": after `left #3` fills Doing, a To do card's right stays enabled though `full` is true. Solid
+  (solidjs/solid#5201, `repro/attribute-misses-guess-on-row-mounted-while-held.spec.tsx`): To do's rows mounted while
+  a move was held, and their `disabled` misses the later guess. With it and #5195 fixed app 1 is 3.
 - app 1 "a column's retry shows loading": Done's buttons read `full` over Doing, which never answers in the test, so
   Done waits on it (guide §1 says to give the answer a value where it's declared).
 - apps 1, 5 "an earlier move declined while a later move is out": app 1 re-asks only the lists the shown move
