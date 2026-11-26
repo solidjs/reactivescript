@@ -65,7 +65,8 @@ export default function rx() {
   function build(entry, target, moduleName, spa) {
     const key = `${entry}\0${target}\0${moduleName}\0${spa}`;
     const prior = builds.get(key);
-    if (prior && fresh(prior)) return prior;
+    // a failed build's stamps miss what it failed to find (MO-6 names the importer), so it is never reused
+    if (prior?.out.modules && fresh(prior)) return prior;
     const out = JSON.parse(app(entry, target, moduleName, spa));
     if (out.modules) out.modules = Object.fromEntries(Object.entries(out.modules).map(([p, m]) => [path.resolve(p), m]));
     const files = out.modules ? Object.keys(out.modules) : out.diagnostics ? [...new Set([entry, ...out.diagnostics.map(d => d.file)])] : [entry];
